@@ -1,0 +1,3 @@
+# The compiled OCR sidecar (`mock-ocr-cli-<target-triple>`) is copied here before
+# `tauri dev`/`tauri build`. It is a build artifact, so it is git-ignored; this
+# .gitkeep just preserves the directory. CI populates it from the workspace build.

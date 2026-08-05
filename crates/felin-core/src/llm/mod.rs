@@ -1,0 +1,83 @@
+//! LLM client (plan step 6): an OpenAI-compatible chat client with a plaintext
+//! translation contract, retry/backoff, and tolerant JSON extraction for the
+//! (non-fatal) name-extraction pass. Default target: StepFun `step-3.7-flash`.
+//!
+//! Endpoint / model / key come from the GUI settings page (wired in a later
+//! step); this module stays transport-only and Tauri-agnostic.
+
+pub mod client;
+pub mod json;
+pub mod prompt;
+
+pub use client::LlmClient;
+pub use json::extract_json;
+pub use prompt::{build_messages, TranslateRequest};
+
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Default OpenAI-compatible base URL (StepFun).
+pub const DEFAULT_ENDPOINT: &str = "https://api.stepfun.com/v1";
+/// Default model.
+pub const DEFAULT_MODEL: &str = "step-3.7-flash";
+
+/// Chat message role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+/// One chat message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: Role,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn system(c: impl Into<String>) -> Self {
+        Self { role: Role::System, content: c.into() }
+    }
+    pub fn user(c: impl Into<String>) -> Self {
+        Self { role: Role::User, content: c.into() }
+    }
+    pub fn assistant(c: impl Into<String>) -> Self {
+        Self { role: Role::Assistant, content: c.into() }
+    }
+}
+
+/// LLM client configuration. Secrets stay local (set from the GUI settings page).
+#[derive(Debug, Clone)]
+pub struct LlmConfig {
+    /// OpenAI-compatible base URL (e.g. `https://api.stepfun.com/v1`).
+    pub endpoint: String,
+    pub model: String,
+    pub api_key: String,
+    /// Per-request timeout.
+    pub timeout: Duration,
+    /// Retries after the first attempt (so total attempts = max_retries + 1).
+    pub max_retries: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: DEFAULT_ENDPOINT.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+            api_key: String::new(),
+            timeout: Duration::from_secs(120),
+            max_retries: 3,
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(30),
+            temperature: None,
+            max_tokens: None,
+        }
+    }
+}

@@ -1,0 +1,36 @@
+# Rust
+/target
+**/target
+Cargo.lock.orig
+
+# Node / frontend
+node_modules
+/ui/dist
+/ui/.vite
+.pnpm-store
+
+# Tauri build artifacts
+/src-tauri/target
+/src-tauri/gen
+# Bundled sidecar binaries are built in CI, not committed (keep the dir).
+/src-tauri/binaries/*
+!/src-tauri/binaries/.gitkeep
+
+# Local databases / runtime data (these live in the OS app-data dir, not the repo;
+# ignored only in case a dev points the app at the working tree). Note: Cargo.lock
+# is intentionally NOT ignored — it is committed for this application.
+*.db
+*.db-wal
+*.db-shm
+*.db.bak-*
+project.lock
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea
+.vscode
+
+# vibe
+plan.md
+PROGRESS.md

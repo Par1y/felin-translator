@@ -1,0 +1,28 @@
+[package]
+name = "mock-ocr-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Contract-faithful mock of `ocr-cli extract` (plan §2/§3/§4/§5) for developing and testing the OCR layer without ocr-router."
+
+[[bin]]
+name = "mock-ocr-cli"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]
+# The end-to-end sidecar test drives felin-core's spawner against this very
+# binary (whose path cargo exposes as CARGO_BIN_EXE_mock-ocr-cli).
+felin-core = { path = "../felin-core" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+[lints.rust]
+unsafe_code = "forbid"

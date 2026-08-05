@@ -1,0 +1,42 @@
+[package]
+name = "felin-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Tauri-agnostic domain logic for Felin Translator (storage, OCR ingest, segmentation, LLM, names, pipeline)."
+
+[dependencies]
+aho-corasick = "1"
+anyhow = "1.0.104"
+chardetng = "1.0.0"
+command-group = { version = "5.0.1", features = ["with-tokio"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+csv = "1"
+encoding_rs = "0.8.35"
+r2d2 = "0.8.10"
+r2d2_sqlite = { version = "0.35.0", features = ["bundled"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10"
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1.44"
+unicode-normalization = "0.1"
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+zip = { version = "2", default-features = false, features = ["deflate", "zstd"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[target."cfg(unix)".dependencies]
+nix = { version = "0.31.3", features = ["signal", "process"] }

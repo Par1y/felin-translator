@@ -1,0 +1,27 @@
+[package]
+name = "felin-translator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Felin Translator — semi-automated Japanese→Chinese translation proofreading workbench."
+
+# The `_lib` suffix avoids a name clash between the bin and lib on Windows,
+# and the crate-type list enables the desktop-bin + (future) mobile-lib split.
+[lib]
+name = "felin_translator_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+felin-core = { path = "../crates/felin-core" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
