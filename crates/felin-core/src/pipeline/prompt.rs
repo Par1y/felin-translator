@@ -62,7 +62,8 @@ pub fn glossary_block(
 
 /// Assemble one TU's translation request. `glossary`/`context`/`instruction`
 /// are the optional blocks; 总则 and context are truncated per limits, the
-/// source passes through untouched.
+/// source passes through untouched. `system_template`/`user_template` come from
+/// `felin.toml [prompt]` (empty → built-in defaults, see [`crate::llm`]).
 #[allow(clippy::too_many_arguments)]
 pub fn build_tu_request(
     system: String,
@@ -72,13 +73,17 @@ pub fn build_tu_request(
     context: Option<String>,
     context_max_chars: usize,
     source: String,
+    system_template: String,
+    user_template: String,
 ) -> TranslateRequest {
     TranslateRequest {
-        system: truncate_chars(&system, guidelines_max_chars),
+        guidelines: truncate_chars(&system, guidelines_max_chars),
         instruction: instruction.map(|s| truncate_chars(&s, guidelines_max_chars)),
         glossary: glossary.map(|s| truncate_chars(&s, guidelines_max_chars)),
         context: context.map(|s| truncate_chars(&s, context_max_chars)),
         source,
+        system_template,
+        user_template,
     }
 }
 

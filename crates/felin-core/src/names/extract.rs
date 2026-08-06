@@ -17,20 +17,33 @@ pub struct Candidate {
     pub context: String,
 }
 
-const EXTRACT_SYSTEM: &str = "你是日文专有名词抽取助手。从给定日文文本中抽取专有名词（人名、地名、\
+/// Default name-extraction system message. Editable via `felin.toml
+/// [prompt].extract_system` (empty there → this default).
+pub const DEFAULT_EXTRACT_SYSTEM: &str = "你是日文专有名词抽取助手。从给定日文文本中抽取专有名词（人名、地名、\
 组织、作品名、独特术语等），忽略普通词汇。只输出 JSON 数组，每项形如 \
 {\"japanese\":\"原文形式\",\"guess_chinese\":\"推测中文\",\"context\":\"简短出处\"}，\
 不要输出任何其他文字。";
 
-/// Run extraction over `chapters` (each entry is a chapter's full text).
-/// Returns candidates deduplicated by normalized japanese form.
-pub async fn extract_names(client: &LlmClient, chapters: &[String]) -> Vec<Candidate> {
+/// Run extraction over `chapters` (each entry is a chapter's full text), using
+/// the user-configurable system message `extract_system` (empty → the built-in
+/// [`DEFAULT_EXTRACT_SYSTEM`]). Returns candidates deduplicated by normalized
+/// japanese form.
+pub async fn extract_names(
+    client: &LlmClient,
+    chapters: &[String],
+    extract_system: &str,
+) -> Vec<Candidate> {
+    let system = if extract_system.trim().is_empty() {
+        DEFAULT_EXTRACT_SYSTEM
+    } else {
+        extract_system
+    };
     let mut merged: BTreeMap<String, Candidate> = BTreeMap::new();
     for (i, text) in chapters.iter().enumerate() {
         if text.trim().is_empty() {
             continue;
         }
-        let messages = [ChatMessage::system(EXTRACT_SYSTEM), ChatMessage::user(text.clone())];
+        let messages = [ChatMessage::system(system), ChatMessage::user(text.clone())];
         let resp = match client.chat(&messages).await {
             Ok(r) => r,
             Err(e) => {
