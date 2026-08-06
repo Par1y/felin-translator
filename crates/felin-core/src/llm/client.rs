@@ -274,7 +274,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = LlmClient::new(cfg(server.uri())).unwrap();
-        let req = TranslateRequest { system: "总则".into(), source: "原文".into(), ..Default::default() };
+        let req = TranslateRequest { guidelines: "总则".into(), source: "原文".into(), ..Default::default() };
         assert_eq!(client.translate(&req).await.unwrap(), "译文");
     }
 

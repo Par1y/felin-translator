@@ -124,6 +124,8 @@ fn cfg(workers: usize, window: usize) -> RunConfig {
         queue_capacity: 64,
         context_max_chars: 4000,
         guidelines_max_chars: 8000,
+        system_template: String::new(),
+        user_template: String::new(),
     }
 }
 
@@ -489,7 +491,7 @@ async fn prompt_injects_glossary_and_context() {
     let req = &reqs[0];
     assert!(req.context.as_deref().unwrap_or("").contains("前段译文"));
     assert!(req.glossary.as_deref().unwrap_or("").contains("田中 → 田中"));
-    assert!(req.system.contains("日译中"));
+    assert!(req.guidelines.contains("日译中"));
     // The alias form matches too; the disabled entry is never injected.
     let alias_req = &reqs[1];
     assert!(alias_req.glossary.as_deref().unwrap_or("").contains("田中 → 田中"));

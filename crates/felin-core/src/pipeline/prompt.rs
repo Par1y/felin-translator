@@ -124,6 +124,8 @@ mod tests {
             Some(long_ctx),
             100,
             long_src.clone(),
+            String::new(),
+            String::new(),
         );
         assert_eq!(req.context.as_ref().unwrap().chars().count(), 101); // 100 + '…'
         assert_eq!(req.source.chars().count(), 50_000);

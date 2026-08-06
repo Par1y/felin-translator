@@ -72,6 +72,10 @@ pub struct RunConfig {
     pub context_max_chars: usize,
     /// Cap on the injected 总则 length (chars).
     pub guidelines_max_chars: usize,
+    /// `[prompt] translation_system` template (empty → built-in default).
+    pub system_template: String,
+    /// `[prompt] translation_user` template (empty → built-in default).
+    pub user_template: String,
 }
 
 /// Progress events emitted to the UI.

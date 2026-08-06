@@ -34,6 +34,7 @@ pub struct TechConfig {
     pub pipeline: PipelineTuning,
     pub db: DbConfig,
     pub import: ImportConfig,
+    pub prompt: PromptConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +127,35 @@ impl Default for ImportConfig {
     }
 }
 
+/// Editable LLM prompt templates (`felin.toml [prompt]`). These replace the
+/// previously hardcoded system/framing text: users can rewrite the
+/// name-extraction system message and the translation system/user message
+/// templates without recompiling. A missing field — or an explicitly empty
+/// string — falls back to the built-in defaults in [`crate::llm::prompt`] /
+/// [`crate::names::extract`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptConfig {
+    /// Name-extraction system message (专名抽取). Empty → built-in default.
+    pub extract_system: String,
+    /// Translation system-message template with `{guidelines}` / `{instruction}`
+    /// / `{glossary}` placeholders. Empty → built-in default.
+    pub translation_system: String,
+    /// Translation user-message template with `{context}` / `{source}`
+    /// placeholders. Empty → built-in default.
+    pub translation_user: String,
+}
+
+impl Default for PromptConfig {
+    fn default() -> Self {
+        Self {
+            extract_system: crate::names::extract::DEFAULT_EXTRACT_SYSTEM.to_string(),
+            translation_system: crate::llm::prompt::DEFAULT_TRANSLATION_SYSTEM.to_string(),
+            translation_user: crate::llm::prompt::DEFAULT_TRANSLATION_USER.to_string(),
+        }
+    }
+}
+
 /// Default LLM transport tunables (endpoint/model/key are user-facing, set in the GUI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -212,7 +242,7 @@ impl TechConfig {
     /// [`TechConfig::default`]; `default_template_matches_defaults` keeps them in
     /// sync. Only written when the file is missing (never overwrites user edits).
     pub fn default_template() -> String {
-        format!(
+        let base = format!(
             r#"# Felin Translator 技术参数配置（felin.toml）
 #
 # 本文件由应用首次启动时自动生成（数据目录，见 PROGRESS §5）。技术参数在此编辑，
@@ -267,6 +297,17 @@ max_file_bytes = 134217728
             // that needs it here) so a regex like `\s` survives the round-trip.
             chapter_pattern = toml_escape(DEFAULT_CHAPTER_PATTERN),
             sentence_enders = toml_escape(DEFAULT_SENTENCE_ENDERS),
+        );
+        // LLM prompt templates (previously hardcoded), appended last so the
+        // first-launch template stays value-identical to `TechConfig::default()`
+        // (locked by `default_template_matches_defaults`).
+        let prompt_block = toml::to_string_pretty(&PromptConfig::default()).unwrap_or_default();
+        format!(
+            "{base}\n# 提示词模板（原先硬编码，现可在此整段改写）。\n\
+             # 翻译 System 占位符 {{guidelines}} {{instruction}} {{glossary}}；\n\
+             # 翻译 User 占位符 {{context}} {{source}}。\n\
+             # 删除某一行即恢复该字段的内置默认；字段留空（\"\"）也按内置默认处理。修改后重启生效。\n\
+             {prompt_block}"
         )
     }
 

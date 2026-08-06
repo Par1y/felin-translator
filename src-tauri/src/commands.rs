@@ -347,6 +347,8 @@ pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<S
         queue_capacity: state.config.pipeline.queue_capacity,
         context_max_chars: state.config.pipeline.context_max_chars,
         guidelines_max_chars: state.config.pipeline.guidelines_max_chars,
+        system_template: state.config.prompt.translation_system.clone(),
+        user_template: state.config.prompt.translation_user.clone(),
     };
     // Build the translator now so config errors reject the invoke synchronously
     // (before any task_id / events exist).
@@ -832,11 +834,9 @@ pub async fn test_llm_connection(state: State<'_, AppState>) -> Result<(), Strin
     };
     let client = LlmClient::new(cfg).map_err(|e| e.to_string())?;
     let req = TranslateRequest {
-        system: "你是连接测试助手。请只回复两个字：通过。".into(),
-        instruction: None,
-        glossary: None,
-        context: None,
+        guidelines: "你是连接测试助手。请只回复两个字：通过。".into(),
         source: "连接测试".into(),
+        ..Default::default()
     };
     client.translate(&req).await.map_err(|e| format!("LLM 连接测试失败：{e}"))?;
     Ok(())
@@ -1600,11 +1600,13 @@ pub fn import_glossary_csv(
 #[tauri::command]
 pub async fn run_name_extraction(state: State<'_, AppState>) -> Result<usize, String> {
     // Gather the client + chapter texts under the lock, then release it before
-    // awaiting the network calls.
-    let (client, chapters) = {
+    // awaiting the network calls. The extraction system message comes from
+    // felin.toml `[prompt].extract_system` (empty → built-in default).
+    let (client, chapters, extract_system) = {
         let guard = state.project_guard();
         let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
         let client = LlmClient::new(load_llm_config(&proj.db, &state.config.llm)?).map_err(|e| e.to_string())?;
+        let extract_system = state.config.prompt.extract_system.clone();
         let mut chapters = Vec::new();
         for ch in proj.db.list_chapters().map_err(|e| e.to_string())? {
             let text = proj
@@ -1617,10 +1619,10 @@ pub async fn run_name_extraction(state: State<'_, AppState>) -> Result<usize, St
                 .join("\n\n");
             chapters.push(text);
         }
-        (client, chapters)
+        (client, chapters, extract_system)
     };
 
-    let candidates = names::extract_names(&client, &chapters).await;
+    let candidates = names::extract_names(&client, &chapters, &extract_system).await;
 
     let guard = state.project_guard();
     let proj = guard.as_ref().ok_or_else(|| "project was closed during extraction".to_string())?;

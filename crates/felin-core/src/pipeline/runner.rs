@@ -296,6 +296,8 @@ async fn run_one<T: Translator + 'static>(
         context,
         cfg.context_max_chars,
         source,
+        cfg.system_template.clone(),
+        cfg.user_template.clone(),
     );
 
     let result = if cfg.stop_aborts_inflight {
