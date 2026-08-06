@@ -4,7 +4,7 @@ use felin_core::storage::{GlobalDb, ProjectDb, ProjectLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 /// The currently-open project. Holds the single-open lock for its lifetime.
 pub struct OpenProject {
@@ -20,6 +20,18 @@ pub struct OpenProject {
     pub lock: ProjectLock,
 }
 
+/// The active translation run, if any. Lives until the run's thread finishes
+/// and deregisters itself (RAII), mirroring [`AppState::tasks`].
+pub struct TranslationRun {
+    pub task_id: String,
+    /// Setting `true` requests a stop (graceful, or aborting per
+    /// `stop_aborts_inflight`); the run thread ends and clears itself.
+    pub stop: watch::Sender<bool>,
+    /// Wake the scheduler so it re-scans the window immediately after a retry /
+    /// re-translate command re-queued TUs.
+    pub wake: Arc<Notify>,
+}
+
 /// Managed application state (`.manage`d on the Tauri app).
 pub struct AppState {
     /// Portable data root: `<software>/felin-data` (or `FELIN_DATA_DIR`).
@@ -28,12 +40,22 @@ pub struct AppState {
     pub config: felin_core::config::TechConfig,
     /// The shared glossary DB, opened at startup.
     pub global: GlobalDb,
-    /// Resolved path to the OCR sidecar binary.
-    pub sidecar: PathBuf,
+    /// OCR sidecar binary (`ocr-cli`) resolved from *user-managed* sources:
+    /// `[sidecar] bin` in `felin.toml`, else `FELIN_SIDECAR`. `None` when the
+    /// user hasn't configured one — commands then report a clear "not
+    /// configured" error instead of guessing a location.
+    pub sidecar: Option<PathBuf>,
+    /// Sidecar's config file (`config.yaml`, holds OCR providers' keys),
+    /// resolved from `[sidecar] config` in `felin.toml`, else
+    /// `FELIN_SIDECAR_CONFIG`. `None` → don't pass `-c`; `ocr-cli` falls back
+    /// to its own default `config.yaml`.
+    pub sidecar_config: Option<PathBuf>,
     /// The single open project, if any.
     pub project: Mutex<Option<OpenProject>>,
     /// Cancellation handles for in-flight OCR imports, keyed by task id.
     pub tasks: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// The active translation run, if any.
+    pub translation: Mutex<Option<TranslationRun>>,
 }
 
 impl AppState {
@@ -50,5 +72,10 @@ impl AppState {
     /// Lock the task registry, recovering from poisoning.
     pub fn tasks_guard(&self) -> MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
         self.tasks.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Lock the translation-run slot, recovering from poisoning.
+    pub fn translation_guard(&self) -> MutexGuard<'_, Option<TranslationRun>> {
+        self.translation.lock().unwrap_or_else(|p| p.into_inner())
     }
 }

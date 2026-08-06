@@ -188,6 +188,65 @@ pub struct Tu {
     pub status: TuStatus,
 }
 
+/// A translation row (`translations` table) — one row per TU. `llm_text` is the
+/// model's raw output, kept forever; `final_text` is the editable, human-approved
+/// draft. Older drafts accumulate in the `attempts` JSON array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Translation {
+    pub id: i64,
+    pub tu_id: i64,
+    pub status: TranslationStatus,
+    /// Normalized-source hash for translation-memory dedup.
+    pub source_hash: Option<String>,
+    pub llm_text: Option<String>,
+    pub final_text: Option<String>,
+    /// Per-item manual guidance, injected on re-translate.
+    pub instruction: Option<String>,
+    pub attempts: Vec<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// User-facing translation settings (per project; N/W/memory toggle live in the
+/// GUI). Technical tuning lives in `felin.toml [pipeline]`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TranslationSettings {
+    /// Translation concurrency — worker pool size N (1–8). Doubles as the LLM rate limit.
+    pub workers: i64,
+    /// Chapter activation window W (1–5): how many chapters' TUs may be in flight.
+    pub window: i64,
+    /// Translation-memory dedup by normalized source hash.
+    pub memory_dedup: bool,
+    /// Stop behavior: false → in-flight TUs complete; true → they are interrupted.
+    pub stop_aborts_inflight: bool,
+}
+
+impl Default for TranslationSettings {
+    fn default() -> Self {
+        Self { workers: 2, window: 1, memory_dedup: true, stop_aborts_inflight: false }
+    }
+}
+
+/// A TU joined with its translation row and source text — the editable
+/// 原文/译文 card the review screen drives from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuWithTranslation {
+    pub id: i64,
+    pub ord: i64,
+    pub budget: Option<i64>,
+    pub status: TuStatus,
+    pub translation_status: Option<TranslationStatus>,
+    /// Effective source text: the user's `source_override` if set, else the
+    /// concatenated paragraph text.
+    pub source: String,
+    pub final_text: Option<String>,
+    pub llm_text: Option<String>,
+    pub instruction: Option<String>,
+    pub error: Option<String>,
+    pub source_hash: Option<String>,
+}
+
 /// A glossary entry from the global DB (`names` table).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlossaryName {
@@ -199,6 +258,74 @@ pub struct GlossaryName {
     pub notes: Option<String>,
     pub source: Option<String>,
     pub status: NameStatus,
+    /// JSON-decoded tag array (user / LLM / source generated: 人名, 地名…).
+    pub tags: Vec<String>,
+    /// Per-entry enable toggle (translation only injects enabled entries).
+    pub enabled: bool,
+}
+
+/// An entry in the project's small glossary (`glossary_entries`).
+///
+/// Self-contained snapshot (japanese/chinese/english/category/tags/aliases copied
+/// at add-time) so a project archive carries its own glossary; `name_global_id`
+/// records provenance in the global big glossary. Translation prompt injection
+/// reads only `enabled = true` entries from here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlossaryEntry {
+    pub id: i64,
+    pub name_global_id: Option<i64>,
+    pub japanese: String,
+    pub chinese: Option<String>,
+    pub english: Option<String>,
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub enabled: bool,
+    /// Japanese alias forms (copied from the global name_aliases at add-time).
+    pub aliases: Vec<String>,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// GUI-managed OCR import options (per project). Deep technical tuning (score
+/// thresholds, byte caps, sidecar path…) stays in `felin.toml`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OcrSettings {
+    /// Concurrent image workers passed to `batch --workers` (images only;
+    /// PDF pages run serially in the sidecar).
+    pub batch_workers: i64,
+    /// Whether to recurse into subdirectories when scanning an image folder.
+    pub batch_recursive: bool,
+}
+
+impl Default for OcrSettings {
+    fn default() -> Self {
+        Self { batch_workers: 4, batch_recursive: false }
+    }
+}
+
+/// Preview of scanning an image directory against an
+/// [`crate::ocr::select::ImageMatchRule`] — what the user confirms before the
+/// `batch` import runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSelection {
+    /// Total image files in the directory (before rule filtering).
+    pub total: usize,
+    /// Files that matched the rule (in natural reading order).
+    pub matched: usize,
+    /// Matched file basenames (ordered).
+    pub names: Vec<String>,
+    /// Sum of matched file sizes (bytes) where stat succeeds.
+    pub bytes: u64,
+}
+
+/// Result of a deterministic 译文导出 (汉化 .txt + CSV).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslationExport {
+    pub txt_path: String,
+    pub csv_path: String,
+    /// Number of TUs with a non-empty translation that were written.
+    pub tus: usize,
 }
 
 /// An extracted proper-noun candidate awaiting review (`extracted_names` table).

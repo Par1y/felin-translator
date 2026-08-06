@@ -11,6 +11,7 @@ use command_group::AsyncCommandGroup;
 #[cfg(unix)]
 use command_group::{Signal, UnixChildExt};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -147,16 +148,28 @@ where
     });
 
     // Drain stderr at the byte level (UTF-8-agnostic, so non-UTF-8 output from C
-    // helpers cannot abort the drain and dead-lock the child on a full pipe).
+    // helpers cannot abort the drain and dead-lock the child on a full pipe),
+    // while keeping a bounded tail so fatal-startup errors (exit 20) can surface
+    // ocr-cli's real reason instead of the generic contract message.
+    let stderr_buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let stderr_task = stderr.map(|se| {
+        let buf = Arc::clone(&stderr_buf);
         tokio::spawn(async move {
             let mut r = BufReader::new(se);
             let mut chunk = Vec::new();
+            const CAP: usize = 16 * 1024;
             loop {
                 chunk.clear();
                 match r.read_until(b'\n', &mut chunk).await {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(_) => {
+                        let mut b = buf.lock().unwrap_or_else(|p| p.into_inner());
+                        b.extend_from_slice(&chunk);
+                        if b.len() > CAP {
+                            let start = b.len() - CAP;
+                            b.drain(..start);
+                        }
+                    }
                 }
             }
         })
@@ -229,6 +242,13 @@ where
     if let Some(t) = stderr_task {
         let _ = t.await;
     }
+    // Pull the captured stderr tail so fatal-startup errors surface the real
+    // cause (e.g. ocr-cli's "failed to load config: open config.yaml: ...").
+    let stderr_tail = {
+        let b = stderr_buf.lock().unwrap_or_else(|p| p.into_inner());
+        String::from_utf8_lossy(&b).into_owned()
+    };
+    let detail = stderr_suffix(&stderr_tail);
 
     if cancelled {
         return Ok(ExtractOutcome::Cancelled);
@@ -240,16 +260,27 @@ where
         Some(10) => Ok(ExtractOutcome::Partial),
         Some(20) => Err(Error::OcrFatal {
             exit_code: 20,
-            message: "fatal startup error: config invalid / renderer missing / no provider".into(),
+            message: format!("fatal startup error: config invalid / renderer missing / no provider{detail}"),
         }),
         Some(code) => Err(Error::OcrFatal {
             exit_code: code,
-            message: format!("sidecar exited with unexpected code {code}"),
+            message: format!("sidecar exited with unexpected code {code}{detail}"),
         }),
         None => Err(Error::OcrFatal {
             exit_code: -1,
             message: "sidecar terminated by a signal without a cancellation request".into(),
         }),
+    }
+}
+
+/// Append the captured sidecar stderr tail (trimmed, line-prefixed) so the error
+/// message carries ocr-cli's own diagnostic rather than only the contract code.
+fn stderr_suffix(tail: &str) -> String {
+    let t = tail.trim();
+    if t.is_empty() {
+        String::new()
+    } else {
+        format!("\nsidecar stderr:\n{t}")
     }
 }
 
@@ -269,3 +300,54 @@ async fn request_stop(child: &mut command_group::AsyncGroupChild) {
         let _ = child.kill().await;
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+    use tokio::sync::watch;
+
+    /// A fake sidecar that writes a diagnostic to stderr and exits 20. The
+    /// contract's generic "fatal startup error" message hides the real cause
+    /// (e.g. ocr-cli's "failed to load config: ..."); the captured stderr tail
+    /// must surface in the OcrFatal message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fatal_startup_surfaces_sidecar_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-sidecar.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'failed to load config: open config.yaml: no such file or directory' >&2\nexit 20\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let args = ExtractArgs {
+            sidecar: script,
+            input: dir.path().join("in.png"),
+            config: None,
+            out_dir: dir.path().join("out"),
+            manifest: dir.path().join("out/m.manifest.json"),
+            pages: None,
+            page_workers: None,
+            skip_existing: false,
+            extra: vec![],
+            envs: vec![],
+        };
+        let (_tx, rx) = watch::channel(false);
+        let err = run_extract(&args, |_| {}, rx).await.unwrap_err();
+        match err {
+            Error::OcrFatal { exit_code, message } => {
+                assert_eq!(exit_code, 20);
+                assert!(
+                    message.contains("failed to load config"),
+                    "message should carry the sidecar's own stderr, got: {message}"
+                );
+            }
+            other => panic!("expected OcrFatal, got {other:?}"),
+        }
+    }
+}
+

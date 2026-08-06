@@ -58,7 +58,7 @@ export default function App() {
         </Header>
         <Content style={{ padding: 16, overflow: "auto" }}>
           {page === "projects" && <ProjectsPage project={project} onChange={refreshProject} />}
-          {page === "import" && <ImportPage onImported={() => setPage("review")} />}
+          {page === "import" && <ImportPage />}
           {page === "review" && <ReviewPage />}
           {page === "names" && <NamesPage />}
           {page === "export" && <ExportPage />}

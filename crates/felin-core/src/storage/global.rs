@@ -10,8 +10,10 @@ use rusqlite::OptionalExtension;
 use std::path::Path;
 
 /// Ordered migration set for the global DB. Append new migrations here.
-pub const GLOBAL_MIGRATIONS: &[Migration] =
-    &[Migration { version: 1, sql: include_str!("migrations/global/0001_init.sql") }];
+pub const GLOBAL_MIGRATIONS: &[Migration] = &[
+    Migration { version: 1, sql: include_str!("migrations/global/0001_init.sql") },
+    Migration { version: 2, sql: include_str!("migrations/global/0002_tags_enabled.sql") },
+];
 
 /// Typed wrapper over the global glossary database.
 #[derive(Debug)]
@@ -145,22 +147,51 @@ impl GlobalDb {
     pub fn list_names(&self, limit: i64) -> Result<Vec<GlossaryName>> {
         self.db.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, japanese, chinese, english, category, notes, source, status
+                "SELECT id, japanese, chinese, english, category, notes, source, status, tags, enabled
                  FROM names ORDER BY updated_at DESC LIMIT ?1",
             )?;
-            let rows = stmt.query_map([limit], |r| {
-                Ok(GlossaryName {
-                    id: r.get(0)?,
-                    japanese: r.get(1)?,
-                    chinese: r.get(2)?,
-                    english: r.get(3)?,
-                    category: r.get(4)?,
-                    notes: r.get(5)?,
-                    source: r.get(6)?,
-                    status: r.get(7)?,
-                })
-            })?;
+            let rows = stmt.query_map([limit], row_to_name)?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+    }
+
+    /// Search the global pool by `japanese` / `chinese` / `english` / a tag,
+    /// most-recently-updated first, capped at `limit`. `q` is matched as a
+    /// substring (tags live in a JSON array column, so a LIKE against it covers
+    /// tag filtering too). Empty `q` lists everything (`%%` matches all rows).
+    pub fn search_names(&self, q: &str, limit: i64) -> Result<Vec<GlossaryName>> {
+        let pat = format!("%{q}%");
+        self.db.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, japanese, chinese, english, category, notes, source, status, tags, enabled
+                 FROM names
+                 WHERE japanese LIKE ?1 OR chinese LIKE ?1 OR english LIKE ?1 OR tags LIKE ?1
+                 ORDER BY updated_at DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![pat, limit], row_to_name)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+    }
+
+    /// Set a global entry's tag array (JSON).
+    pub fn set_name_tags(&self, id: i64, tags: &[String]) -> Result<()> {
+        self.db.write(|c| {
+            c.execute(
+                "UPDATE names SET tags = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![serde_json::to_string(tags).unwrap_or_else(|_| "[]".into()), now_iso8601(), id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Toggle a global entry's enabled flag.
+    pub fn set_name_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        self.db.write(|c| {
+            c.execute(
+                "UPDATE names SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![enabled as i64, now_iso8601(), id],
+            )?;
+            Ok(())
         })
     }
 
@@ -185,23 +216,44 @@ impl GlobalDb {
     pub fn get_name(&self, id: i64) -> Result<Option<GlossaryName>> {
         self.db.read(|c| {
             c.query_row(
-                "SELECT id, japanese, chinese, english, category, notes, source, status FROM names WHERE id = ?1",
+                "SELECT id, japanese, chinese, english, category, notes, source, status, tags, enabled
+                 FROM names WHERE id = ?1",
                 [id],
-                |r| {
-                    Ok(GlossaryName {
-                        id: r.get(0)?,
-                        japanese: r.get(1)?,
-                        chinese: r.get(2)?,
-                        english: r.get(3)?,
-                        category: r.get(4)?,
-                        notes: r.get(5)?,
-                        source: r.get(6)?,
-                        status: r.get(7)?,
-                    })
-                },
+                row_to_name,
             )
             .optional()
             .map_err(Into::into)
         })
     }
+
+    /// The alias forms of one entry (canonical japanese excluded), for copying
+    /// into a project's self-contained small glossary.
+    pub fn aliases_for(&self, name_id: i64) -> Result<Vec<String>> {
+        self.db.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT japanese_form FROM name_aliases WHERE name_id = ?1 ORDER BY japanese_form",
+            )?;
+            let rows = stmt.query_map([name_id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<String>>>().map_err(Into::into)
+        })
+    }
+}
+
+/// Map a global `names` row (column order: id, japanese, chinese, english,
+/// category, notes, source, status, tags, enabled) to a [`GlossaryName`].
+fn row_to_name(r: &rusqlite::Row<'_>) -> rusqlite::Result<GlossaryName> {
+    let tags_json: String = r.get(8)?;
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    Ok(GlossaryName {
+        id: r.get(0)?,
+        japanese: r.get(1)?,
+        chinese: r.get(2)?,
+        english: r.get(3)?,
+        category: r.get(4)?,
+        notes: r.get(5)?,
+        source: r.get(6)?,
+        status: r.get(7)?,
+        tags,
+        enabled: r.get::<_, i64>(9)? != 0,
+    })
 }

@@ -33,6 +33,21 @@ struct RespMsg {
     content: String,
 }
 
+/// Build the chat-completions URL from a configured endpoint.
+///
+/// The endpoint may be either a bare base (`https://api.stepfun.com/v1`) or a
+/// full chat-completions URL already (`https://api.stepfun.com/step_plan/v1/
+/// chat/completions`, as ocr-router's config uses). Blindly appending the
+/// suffix to the latter would double it and yield an HTTP 404.
+fn chat_url(endpoint: &str) -> String {
+    let e = endpoint.trim();
+    if e.ends_with("/chat/completions") {
+        e.to_string()
+    } else {
+        format!("{}/chat/completions", e.trim_end_matches('/'))
+    }
+}
+
 impl LlmClient {
     /// Build a client from `config`.
     pub fn new(config: LlmConfig) -> Result<Self> {
@@ -55,7 +70,7 @@ impl LlmClient {
 
     /// One chat completion, with retry/backoff on transient failures.
     pub async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
-        let url = format!("{}/chat/completions", self.config.endpoint.trim_end_matches('/'));
+        let url = chat_url(&self.config.endpoint);
         let mut body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
@@ -116,7 +131,17 @@ impl LlmClient {
 
         let retry_after = parse_retry_after(resp.headers());
         let code = status.as_u16();
-        let detail = format!("HTTP {code}: {}", truncate(&resp.text().await.unwrap_or_default(), 500));
+        let body = truncate(&resp.text().await.unwrap_or_default(), 500);
+        let mut detail = format!("HTTP {code}: {body}");
+        if code == 404 {
+            // The most common cause is an endpoint that already ends in
+            // /chat/completions (as ocr-router's config uses); a wrong model
+            // name or an account without that model also 404s here.
+            detail.push_str(
+                "（endpoint 可能多写了一层 /chat/completions，应填 https://host/v1 或完整 URL；\
+                 或模型名/路径不对，账号无权访问该模型）",
+            );
+        }
         // 429 / 408 / 5xx are transient; other 4xx (400/401/403/404) fast-fail.
         if code == 429 || code == 408 || status.is_server_error() {
             Err(CallError::Retryable { msg: detail, retry_after })
@@ -157,11 +182,9 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-// PLACEHOLDER_CLIENT_TESTS
-
 #[cfg(test)]
 mod tests {
-    use super::LlmClient;
+    use super::{chat_url, LlmClient};
     use crate::error::Error;
     use crate::llm::{ChatMessage, LlmConfig, TranslateRequest};
     use serde_json::json;
@@ -253,5 +276,48 @@ mod tests {
         let client = LlmClient::new(cfg(server.uri())).unwrap();
         let req = TranslateRequest { system: "总则".into(), source: "原文".into(), ..Default::default() };
         assert_eq!(client.translate(&req).await.unwrap(), "译文");
+    }
+
+    #[test]
+    fn chat_url_handles_base_and_full_urls() {
+        // Bare base → append once.
+        assert_eq!(chat_url("https://api.stepfun.com/v1"), "https://api.stepfun.com/v1/chat/completions");
+        assert_eq!(chat_url("https://api.stepfun.com/v1/"), "https://api.stepfun.com/v1/chat/completions");
+        // A trailing full URL is kept verbatim (no double suffix → 404).
+        assert_eq!(
+            chat_url("https://api.stepfun.com/step_plan/v1/chat/completions"),
+            "https://api.stepfun.com/step_plan/v1/chat/completions"
+        );
+        // Whitespace around the value is trimmed.
+        assert_eq!(chat_url("  https://host/v1  "), "https://host/v1/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn full_url_endpoint_hits_single_chat_completions_path() {
+        let server = MockServer::start().await;
+        // The configured endpoint already ends in /chat/completions — the client
+        // must NOT append the suffix again, or this route (and thus the test)
+        // would 404.
+        Mock::given(method("POST"))
+            .and(path("/step_plan/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("好")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = format!("{}/step_plan/v1/chat/completions", server.uri());
+        let client = LlmClient::new(cfg(endpoint)).unwrap();
+        assert_eq!(client.chat(&[ChatMessage::user("hi")]).await.unwrap(), "好");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fatal_404_carries_endpoint_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(404)).expect(1).mount(&server).await;
+        let client = LlmClient::new(cfg(server.uri())).unwrap();
+        let err = client.chat(&[ChatMessage::user("hi")]).await.unwrap_err();
+        let Error::Llm { detail } = err else { panic!("expected Llm error") };
+        assert!(detail.contains("/chat/completions"), "hint should mention endpoint format: {detail}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "404 is fatal, no retry");
     }
 }

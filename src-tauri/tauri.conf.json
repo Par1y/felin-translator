@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.felin.translator",
   "build": {
-    "beforeDevCommand": "pnpm --dir ui dev",
-    "beforeBuildCommand": "pnpm --dir ui build",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../ui/dist"
   },
@@ -37,7 +37,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/mock-ocr-cli"],
+    "externalBin": [],
     "resources": [],
     "linux": {
       "deb": {

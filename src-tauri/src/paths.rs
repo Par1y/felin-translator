@@ -6,10 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// The sidecar binary name (without the target-triple suffix Tauri strips at
-/// bundle time). Swap to the real `ocr-cli` once ocr-router implements the
-/// contract; the app looks for exactly this name beside its executable.
-pub const SIDECAR_BIN: &str = "mock-ocr-cli";
+/// Dev override env vars (mirroring `FELIN_DATA_DIR`): point the OCR backend
+/// (sidecar binary) and its config anywhere for a dev run, e.g.
+/// `../ocr-router/bin/ocr-cli`, without editing `felin.toml`.
+const ENV_SIDECAR: &str = "FELIN_SIDECAR";
+const ENV_SIDECAR_CONFIG: &str = "FELIN_SIDECAR_CONFIG";
 
 /// Directory containing the executable, accounting for the `deps/` dir used by
 /// `cargo run`/tests.
@@ -32,18 +33,34 @@ pub fn data_root() -> PathBuf {
         return PathBuf::from(dir);
     }
     if let Some(appimage) = std::env::var_os("APPIMAGE") {
-        if let Some(parent) = Path::new(&appimage).parent() {
+        if let Some(parent) = std::path::Path::new(&appimage).parent() {
             return parent.join("felin-data");
         }
     }
     exe_dir().unwrap_or_else(|| PathBuf::from(".")).join("felin-data")
 }
 
-/// Resolve the bundled sidecar's on-disk path. Tauri places `externalBin`
-/// entries next to the main executable (triple suffix stripped), so this mirrors
-/// Tauri's own resolver — no shell plugin required.
-pub fn resolve_sidecar() -> std::io::Result<PathBuf> {
-    let base = exe_dir().ok_or_else(|| std::io::Error::other("cannot resolve executable directory"))?;
-    let file = if cfg!(windows) { format!("{SIDECAR_BIN}.exe") } else { SIDECAR_BIN.to_string() };
-    Ok(base.join(file))
+/// Resolve the OCR backend (sidecar) binary path from *user-managed* sources
+/// only: `[sidecar] bin` in `felin.toml`, else `FELIN_SIDECAR`. Returns `None`
+/// when neither is set — the caller reports a clear "not configured" error
+/// rather than guessing a location. The expected binary is the real `ocr-cli`
+/// from the ocr-router project (`mock-ocr-cli` is automated-test-only and never
+/// the production backend).
+pub fn resolve_sidecar(cfg_bin: Option<&str>) -> Option<PathBuf> {
+    cfg_bin
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os(ENV_SIDECAR).map(PathBuf::from))
+}
+
+/// Resolve the OCR backend config file path from user-managed sources only:
+/// `[sidecar] config` in `felin.toml`, else `FELIN_SIDECAR_CONFIG`. `None`
+/// means "don't pass `-c`" — `ocr-cli` then uses its own default `config.yaml`
+/// (the ocr-router project's own user-managed config, which holds provider
+/// keys).
+pub fn resolve_sidecar_config(cfg_config: Option<&str>) -> Option<PathBuf> {
+    cfg_config
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os(ENV_SIDECAR_CONFIG).map(PathBuf::from))
 }

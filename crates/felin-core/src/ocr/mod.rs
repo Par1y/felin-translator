@@ -10,9 +10,15 @@
 //! - [`ingest`] — pure paragraph assembly + cross-page merge.
 //! - [`txt`] — plain-text import.
 //! - [`sidecar`] — async process spawn, progress streaming, cancel/kill.
+//! - [`select`] — image-directory selection (match presets, natural order, range).
+//! - [`batch`] — `batch` sidecar orchestration + per-txt ingest.
+//! - [`config`] — in-place read/write of the ocr-router `config.yaml`.
 
+pub mod batch;
+pub mod config;
 pub mod contract;
 pub mod ingest;
+pub mod select;
 pub mod sidecar;
 pub mod txt;
 
@@ -24,6 +30,7 @@ use std::path::Path;
 
 pub use contract::{Manifest as OcrManifest, ProgressEvent};
 pub use sidecar::{ExtractArgs, ExtractOutcome};
+pub use config::{OcrConfig, OcrEvaluatorConfig, OcrProviderConfig};
 
 /// Default score threshold below which a page's paragraphs are flagged
 /// low-score (used when the evaluator is on). Overridable per project.

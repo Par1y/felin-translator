@@ -1,20 +1,33 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AddGlossaryEntryInput,
   AppInfo,
   Chapter,
   CsvMapping,
   ErrorPayload,
   ExportResult,
   ExtractedName,
+  FileSelection,
+  GlossaryEntry,
+  GlossaryEntryInput,
   GlossaryName,
+  ImageMatchRule,
   ImportResult,
   LlmConfigView,
+  OcrConfig,
+  OcrSettings,
   Paragraph,
   ProgressPayload,
   ProjectSummary,
   SegmentResult,
+  TranslationDonePayload,
+  TranslationExport,
+  TranslationProgressPayload,
+  TranslationSettings,
+  TranslationStatusView,
   Tu,
+  TuWithTranslation,
   TxtImportResult,
 } from "./types";
 
@@ -36,21 +49,72 @@ export const api = {
   importOcr: (input: string, pages?: string) =>
     invoke<string>("import_ocr", { input, pages: pages ?? null }),
   cancelImport: (taskId: string) => invoke<void>("cancel_import", { taskId }),
+  scanImageDir: (dir: string, rule: ImageMatchRule) =>
+    invoke<FileSelection>("scan_image_dir", { dir, rule }),
+  importImagesBatch: (dir: string, rule: ImageMatchRule) =>
+    invoke<string>("import_images_batch", { dir, rule }),
   exportProject: (destPath: string) => invoke<ExportResult>("export_project", { destPath }),
   importProject: (archivePath: string) => invoke<ProjectSummary>("import_project", { archivePath }),
 
   getLlmConfig: () => invoke<LlmConfigView>("get_llm_config"),
   setLlmConfig: (endpoint?: string, model?: string, apiKey?: string) =>
     invoke<void>("set_llm_config", { endpoint: endpoint ?? null, model: model ?? null, apiKey: apiKey ?? null }),
+  testLlmConnection: () => invoke<void>("test_llm_connection"),
   csvHeaders: (path: string) => invoke<string[]>("csv_headers", { path }),
-  importGlossaryCsv: (path: string, mapping: CsvMapping) =>
-    invoke<number>("import_glossary_csv", { path, mapping }),
-  listGlossary: (limit?: number) => invoke<GlossaryName[]>("list_glossary", { limit: limit ?? null }),
+  importGlossaryCsv: (path: string, mapping: CsvMapping, target: "project" | "global") =>
+    invoke<number>("import_glossary_csv", { path, mapping, target }),
+  listGlossary: (q?: string, limit?: number) =>
+    invoke<GlossaryName[]>("list_glossary", { q: q ?? null, limit: limit ?? null }),
+  setGlobalNameTags: (id: number, tags: string[]) =>
+    invoke<void>("set_global_name_tags", { id, tags }),
+  setGlobalNameEnabled: (id: number, enabled: boolean) =>
+    invoke<void>("set_global_name_enabled", { id, enabled }),
   runNameExtraction: () => invoke<number>("run_name_extraction"),
   listExtracted: (status?: string) => invoke<ExtractedName[]>("list_extracted", { status: status ?? null }),
   updateExtracted: (id: number, chinese: string) => invoke<void>("update_extracted", { id, chinese }),
   rejectExtracted: (id: number) => invoke<void>("reject_extracted", { id }),
-  confirmExtracted: (id: number) => invoke<void>("confirm_extracted", { id }),
+  confirmExtracted: (id: number, target: "project" | "global") =>
+    invoke<void>("confirm_extracted", { id, target }),
+
+  startTranslation: () => invoke<string>("start_translation"),
+  stopTranslation: () => invoke<void>("stop_translation"),
+  translationStatus: () => invoke<TranslationStatusView>("translation_status"),
+  retryTranslation: (scope: "tu" | "chapter" | "all", ids: number[]) =>
+    invoke<number>("retry_translation", { scope, ids }),
+  approveTu: (tuId: number) => invoke<boolean>("approve_tu", { tuId }),
+  setTuInstruction: (tuId: number, instruction: string) =>
+    invoke<void>("set_tu_instruction", { tuId, instruction }),
+  retranslateTu: (tuId: number, instruction: string) =>
+    invoke<boolean>("retranslate_tu", { tuId, instruction }),
+  retranslateTus: (ids: number[], instruction?: string) =>
+    invoke<number>("retranslate_tus", { ids, instruction: instruction ?? null }),
+  getTranslationSettings: () => invoke<TranslationSettings>("get_translation_settings"),
+  setTranslationSettings: (s: TranslationSettings) =>
+    invoke<void>("set_translation_settings", { settings: s }),
+  getGuidelines: () => invoke<string>("get_guidelines"),
+  setGuidelines: (text: string) => invoke<void>("set_guidelines", { text }),
+  listTusWithTranslations: (chapterId: number) =>
+    invoke<TuWithTranslation[]>("list_tus_with_translations", { chapterId }),
+  setTuSource: (tuId: number, source: string) => invoke<void>("set_tu_source", { tuId, source }),
+  setTranslationText: (tuId: number, text: string) =>
+    invoke<boolean>("set_translation_text", { tuId, text }),
+
+  getOcrSettings: () => invoke<OcrSettings>("get_ocr_settings"),
+  setOcrSettings: (s: OcrSettings) => invoke<void>("set_ocr_settings", { settings: s }),
+  getOcrConfig: () => invoke<OcrConfig>("get_ocr_config"),
+  setOcrConfig: (c: OcrConfig) => invoke<void>("set_ocr_config", { config: c }),
+  exportTranslations: (destDir: string) =>
+    invoke<TranslationExport>("export_translations", { destDir }),
+
+  listGlossaryEntries: (q?: string) =>
+    invoke<GlossaryEntry[]>("list_glossary_entries", { q: q ?? null }),
+  addGlossaryEntry: (e: AddGlossaryEntryInput) => invoke<number>("add_glossary_entry", { ...e }),
+  updateGlossaryEntry: (id: number, e: GlossaryEntryInput) =>
+    invoke<void>("update_glossary_entry", { id, ...e }),
+  setEntryEnabled: (id: number, enabled: boolean) =>
+    invoke<void>("set_entry_enabled", { id, enabled }),
+  setEntryTags: (id: number, tags: string[]) => invoke<void>("set_entry_tags", { id, tags }),
+  deleteGlossaryEntry: (id: number) => invoke<void>("delete_glossary_entry", { id }),
 };
 
 export function onOcrProgress(cb: (p: ProgressPayload) => void): Promise<UnlistenFn> {
@@ -63,4 +127,18 @@ export function onOcrDone(cb: (r: ImportResult) => void): Promise<UnlistenFn> {
 
 export function onOcrError(cb: (e: ErrorPayload) => void): Promise<UnlistenFn> {
   return listen<ErrorPayload>("ocr://error", (e) => cb(e.payload));
+}
+
+export function onTranslationProgress(
+  cb: (p: TranslationProgressPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<TranslationProgressPayload>("translation://progress", (e) => cb(e.payload));
+}
+
+export function onTranslationDone(cb: (r: TranslationDonePayload) => void): Promise<UnlistenFn> {
+  return listen<TranslationDonePayload>("translation://done", (e) => cb(e.payload));
+}
+
+export function onTranslationError(cb: (e: ErrorPayload) => void): Promise<UnlistenFn> {
+  return listen<ErrorPayload>("translation://error", (e) => cb(e.payload));
 }

@@ -11,20 +11,29 @@
 
 use crate::state::{AppState, OpenProject};
 use felin_core::archive;
-use felin_core::llm::LlmClient;
+use felin_core::llm::{LlmClient, prompt::TranslateRequest};
 use felin_core::names;
+use felin_core::ocr::contract::PageStatus;
 use felin_core::ocr::sidecar::run_extract;
 use felin_core::ocr::{
+    batch::{ingest_batch_txts, run_batch, BatchArgs, BatchEvent},
+    config::{apply_and_write, read_config_file, OcrConfig},
+    select::{select_images, ImageMatchRule},
     ingest_from_manifest, read_manifest, ExtractArgs, ExtractOutcome, ProgressEvent,
 };
+use felin_core::pipeline::{run_pipeline, LlmTranslator, PipelineEvent, RunConfig};
 use felin_core::storage::{DbTuning, ProjectDb, ProjectLock};
-use felin_core::types::{Chapter, ExtractedName, ExtractedNameStatus, GlossaryName, NameStatus, Paragraph, Tu};
+use felin_core::types::{
+    Chapter, ExtractedName, ExtractedNameStatus, FileSelection, GlossaryEntry, GlossaryName,
+    NameStatus, OcrSettings, Paragraph, TranslationExport, TranslationSettings, Tu,
+    TuWithTranslation,
+};
 use felin_core::util::now_iso8601;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch, Notify};
 
 // PLACEHOLDER_TYPES
 
@@ -34,6 +43,8 @@ pub struct AppInfo {
     pub data_dir: String,
     pub sidecar: String,
     pub sidecar_present: bool,
+    pub ocr_config_path: String,
+    pub ocr_config_present: bool,
     pub glossary_names: i64,
 }
 
@@ -169,8 +180,14 @@ pub fn app_info(state: State<'_, AppState>) -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         data_dir: state.data_dir.display().to_string(),
-        sidecar: state.sidecar.display().to_string(),
-        sidecar_present: state.sidecar.exists(),
+        sidecar: state.sidecar.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        sidecar_present: state.sidecar.as_ref().is_some_and(|p| p.exists()),
+        ocr_config_path: state
+            .sidecar_config
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        ocr_config_present: state.sidecar_config.as_ref().is_some_and(|p| p.exists()),
         glossary_names: state.global.count_names().unwrap_or(0),
     }
 }
@@ -270,6 +287,562 @@ pub fn list_tus(state: State<'_, AppState>, chapter_id: i64) -> Result<Vec<Tu>, 
     with_project(&state, |p| p.db.list_tus(chapter_id))
 }
 
+// ----- translation pipeline (plan step 8) ---------------------------------
+
+/// A progress event relayed from the pipeline to the frontend.
+#[derive(Serialize, Clone)]
+pub struct TranslationProgressPayload {
+    pub task_id: String,
+    pub event: PipelineEvent,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TranslationDonePayload {
+    pub task_id: String,
+}
+
+/// Per-status TU count for the status bar.
+#[derive(Serialize, Clone)]
+pub struct StatusCount {
+    pub status: String,
+    pub count: i64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TranslationStatusView {
+    pub running: bool,
+    pub task_id: Option<String>,
+    pub workers: i64,
+    pub window: i64,
+    pub active_chapters: Vec<i64>,
+    pub counts: Vec<StatusCount>,
+}
+
+/// Start a translation pass over the open project's eligible TUs. Returns a
+/// `task_id` immediately; progress arrives via `translation://progress` and
+/// completion via `translation://done` / `translation://error`. Stop with
+/// [`stop_translation`]; retry with [`retry_translation`] / [`retranslate_tu`]
+/// (which wake a running scheduler via the stored [`Notify`]).
+#[tauri::command]
+pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    // One run at a time; the run thread deregisters itself when it finishes.
+    if state.translation_guard().is_some() {
+        return Err("translation already running".into());
+    }
+    // Capture everything the run thread needs under the project lock. Glossary
+    // data for prompt injection is fetched by the pipeline itself from the
+    // project's enabled small-glossary entries.
+    let (db, settings, llm_cfg) = {
+        let guard = state.project_guard();
+        let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
+        let settings = proj.db.get_translation_settings().map_err(|e| e.to_string())?;
+        let llm_cfg = load_llm_config(&proj.db, &state.config.llm)?;
+        (Arc::clone(&proj.db), settings, llm_cfg)
+    };
+    let cfg = RunConfig {
+        workers: settings.workers as usize,
+        window: settings.window as usize,
+        memory_dedup: settings.memory_dedup,
+        stop_aborts_inflight: settings.stop_aborts_inflight,
+        queue_capacity: state.config.pipeline.queue_capacity,
+        context_max_chars: state.config.pipeline.context_max_chars,
+        guidelines_max_chars: state.config.pipeline.guidelines_max_chars,
+    };
+    // Build the translator now so config errors reject the invoke synchronously
+    // (before any task_id / events exist).
+    let translator = Arc::new(LlmTranslator {
+        client: LlmClient::new(llm_cfg).map_err(|e| e.to_string())?,
+    });
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let wake = Arc::new(Notify::new());
+    *state.translation_guard() = Some(crate::state::TranslationRun {
+        task_id: task_id.clone(),
+        stop: stop_tx,
+        wake: Arc::clone(&wake),
+    });
+
+    let app_thread = app.clone();
+    let tid = task_id.clone();
+    std::thread::spawn(move || {
+        // RAII: always clear the translation-run slot, on every exit path, but
+        // only if it's still *this* run (a later run must not be clobbered).
+        struct Dereg {
+            app: AppHandle,
+            tid: String,
+        }
+        impl Drop for Dereg {
+            fn drop(&mut self) {
+                if let Some(st) = self.app.try_state::<AppState>() {
+                    let mut g = st.translation_guard();
+                    if g.as_ref().is_some_and(|r| r.task_id == self.tid) {
+                        *g = None;
+                    }
+                }
+            }
+        }
+        let _dereg = Dereg { app: app_thread.clone(), tid: tid.clone() };
+
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = app_thread.emit(
+                    "translation://error",
+                    ErrorPayload { task_id: tid, message: format!("could not start runtime: {e}") },
+                );
+                return;
+            }
+        };
+        // catch_unwind so a panic still produces a terminal event.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                let (ev_tx, ev_rx) = mpsc::unbounded_channel::<PipelineEvent>();
+                tokio::join!(
+                    run_pipeline(db, translator, cfg, stop_rx, wake, ev_tx),
+                    forward_translation_events(&app_thread, &tid, ev_rx),
+                )
+            })
+        }));
+        match result {
+            Ok((Ok(()), _)) => {
+                let _ = app_thread.emit("translation://done", TranslationDonePayload { task_id: tid });
+            }
+            Ok((Err(message), _)) => {
+                let _ = app_thread.emit(
+                    "translation://error",
+                    ErrorPayload { task_id: tid.clone(), message: message.to_string() },
+                );
+            }
+            Err(_) => {
+                let _ = app_thread.emit(
+                    "translation://error",
+                    ErrorPayload { task_id: tid.clone(), message: "translation task panicked".into() },
+                );
+            }
+        }
+    });
+
+    Ok(task_id)
+}
+
+/// Relay pipeline progress events to the frontend (`translation://progress`).
+async fn forward_translation_events(
+    app: &AppHandle,
+    task_id: &str,
+    mut rx: mpsc::UnboundedReceiver<PipelineEvent>,
+) {
+    while let Some(event) = rx.recv().await {
+        let _ = app.emit(
+            "translation://progress",
+            TranslationProgressPayload { task_id: task_id.to_string(), event },
+        );
+    }
+}
+
+/// Request a stop of the active translation run (graceful, or aborting per the
+/// project's `stop_aborts_inflight` setting). The run thread ends and clears
+/// itself; a `translation://done` / `translation://error` event follows.
+#[tauri::command]
+pub fn stop_translation(state: State<'_, AppState>) -> Result<(), String> {
+    let guard = state.translation_guard();
+    match guard.as_ref() {
+        Some(run) => {
+            let _ = run.stop.send(true);
+            Ok(())
+        }
+        None => Err("no translation is running".into()),
+    }
+}
+
+/// Live view of the pipeline: whether a run is active, the project's N/W, the
+/// current activation window (chapter ids), and TU counts by status.
+#[tauri::command]
+pub fn translation_status(state: State<'_, AppState>) -> Result<TranslationStatusView, String> {
+    let (running, task_id) = {
+        let guard = state.translation_guard();
+        (guard.is_some(), guard.as_ref().map(|r| r.task_id.clone()))
+    };
+    with_project(&state, |p| {
+        let settings = p.db.get_translation_settings()?;
+        let active_chapters = p.db.active_chapter_ids(settings.window as usize)?;
+        let counts = p
+            .db
+            .counts_by_status()?
+            .into_iter()
+            .map(|(status, count)| StatusCount { status: status.as_str().to_string(), count })
+            .collect();
+        Ok(TranslationStatusView {
+            running,
+            task_id,
+            workers: settings.workers,
+            window: settings.window,
+            active_chapters,
+            counts,
+        })
+    })
+}
+
+/// Explicit retry: re-queue `failed_*`/`interrupted` TUs, scoped to
+/// `scope` = `"tu"` (ids), `"chapter"` (ids[0]), or `"all"`. Returns how many
+/// were re-queued. If a run is active, its scheduler is woken to re-scan.
+#[tauri::command]
+pub fn retry_translation(
+    state: State<'_, AppState>,
+    scope: String,
+    ids: Vec<i64>,
+) -> Result<usize, String> {
+    let requeued = with_project(&state, |p| match scope.as_str() {
+        "tu" => p.db.requeue_failed(Some(&ids), None),
+        "chapter" => {
+            let ch = *ids.first().ok_or_else(|| felin_core::Error::InvalidInput {
+                detail: "scope=chapter requires a chapter id".into(),
+            })?;
+            p.db.requeue_failed(None, Some(ch))
+        }
+        "all" => p.db.requeue_failed(None, None),
+        other => Err(felin_core::Error::InvalidInput {
+            detail: format!("unknown retry scope: {other}"),
+        }),
+    })?;
+    if requeued > 0 {
+        if let Some(run) = state.translation_guard().as_ref() {
+            run.wake.notify_one();
+        }
+    }
+    Ok(requeued)
+}
+
+/// Human "approve" transition: `translated`/`reviewing` → `approved`.
+#[tauri::command]
+pub fn approve_tu(state: State<'_, AppState>, tu_id: i64) -> Result<bool, String> {
+    with_project(&state, |p| p.db.approve_tu(tu_id))
+}
+
+/// Persist (or clear, when empty) a per-item translation instruction.
+#[tauri::command]
+pub fn set_tu_instruction(
+    state: State<'_, AppState>,
+    tu_id: i64,
+    instruction: String,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.set_tu_instruction(tu_id, &instruction))
+}
+
+/// Re-translate one TU: move it back to `queued` (with optional per-item
+/// instruction) and wake the scheduler if a run is active. Returns false if the
+/// TU is mid-flight (`pending`/`queued`/`translating`).
+#[tauri::command]
+pub fn retranslate_tu(
+    state: State<'_, AppState>,
+    tu_id: i64,
+    instruction: String,
+) -> Result<bool, String> {
+    let ok = with_project(&state, |p| p.db.retranslate_tu(tu_id, &instruction))?;
+    if ok {
+        if let Some(run) = state.translation_guard().as_ref() {
+            run.wake.notify_one();
+        }
+    }
+    Ok(ok)
+}
+
+#[tauri::command]
+pub fn get_translation_settings(state: State<'_, AppState>) -> Result<TranslationSettings, String> {
+    with_project(&state, |p| p.db.get_translation_settings())
+}
+
+#[tauri::command]
+pub fn set_translation_settings(
+    state: State<'_, AppState>,
+    settings: TranslationSettings,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.set_translation_settings(&settings))
+}
+
+/// The project 总则 (system prompt), falling back to the default template.
+#[tauri::command]
+pub fn get_guidelines(state: State<'_, AppState>) -> Result<String, String> {
+    with_project(&state, |p| p.db.get_guidelines())
+}
+
+#[tauri::command]
+pub fn set_guidelines(state: State<'_, AppState>, text: String) -> Result<(), String> {
+    with_project(&state, |p| p.db.set_guidelines(&text))
+}
+
+/// A TU joined with its translation row — the read-only status list the review
+/// screen drives from (step 8's minimal UI).
+#[tauri::command]
+pub fn list_tus_with_translations(
+    state: State<'_, AppState>,
+    chapter_id: i64,
+) -> Result<Vec<TuWithTranslation>, String> {
+    with_project(&state, |p| p.db.list_tus_with_translations(chapter_id))
+}
+
+/// Override the effective source text of a TU (what translation/editing sees);
+/// passing a blank string clears the override and falls back to the paragraphs.
+#[tauri::command]
+pub fn set_tu_source(
+    state: State<'_, AppState>,
+    tu_id: i64,
+    source: String,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.set_tu_source(tu_id, &source))
+}
+
+/// Persist an edited translation. Returns true if this demoted an
+/// approved/exported TU back to reviewing (i.e. the TU is no longer final).
+#[tauri::command]
+pub fn set_translation_text(
+    state: State<'_, AppState>,
+    tu_id: i64,
+    text: String,
+) -> Result<bool, String> {
+    with_project(&state, |p| p.db.set_translation_text(tu_id, &text))
+}
+
+/// Re-translate a batch of TUs: requeue each (with an optional per-run
+/// instruction) and wake a running scheduler so it re-scans immediately.
+/// Returns how many were actually requeued (mid-flight TUs are skipped).
+#[tauri::command]
+pub fn retranslate_tus(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+    instruction: Option<String>,
+) -> Result<usize, String> {
+    let n = with_project(&state, |p| p.db.retranslate_tus(&ids, instruction.as_deref()))?;
+    if n > 0 {
+        if let Some(run) = state.translation_guard().as_ref() {
+            run.wake.notify_one();
+        }
+    }
+    Ok(n)
+}
+
+/// GUI-managed OCR options (batch worker count, recursion) for this project.
+#[tauri::command]
+pub fn get_ocr_settings(state: State<'_, AppState>) -> Result<OcrSettings, String> {
+    with_project(&state, |p| p.db.get_ocr_settings())
+}
+
+#[tauri::command]
+pub fn set_ocr_settings(
+    state: State<'_, AppState>,
+    settings: OcrSettings,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.set_ocr_settings(&settings))
+}
+
+/// Read the app-editable slice of the ocr-router `config.yaml` — the file
+/// referenced by felin.toml `[sidecar] config` / `FELIN_SIDECAR_CONFIG`. No
+/// project needs to be open; the config is app-level. Errors if the path was
+/// never configured or the file is missing ("禁止硬编码，找不到即报错").
+#[tauri::command]
+pub fn get_ocr_config(state: State<'_, AppState>) -> Result<OcrConfig, String> {
+    let path = state
+        .sidecar_config
+        .as_ref()
+        .ok_or_else(|| "未配置 OCR 配置文件（felin.toml [sidecar] config 或 FELIN_SIDECAR_CONFIG）".to_string())?;
+    read_config_file(path).map_err(|e| e.to_string())
+}
+
+/// Write the app-editable slice back to the **same** config.yaml, in place.
+/// Unmanaged sections and `${ENV}` placeholders are preserved; comments and
+/// hand formatting are normalized (the UI warns the user about this).
+#[tauri::command]
+pub fn set_ocr_config(state: State<'_, AppState>, config: OcrConfig) -> Result<(), String> {
+    let path = state
+        .sidecar_config
+        .as_ref()
+        .ok_or_else(|| "未配置 OCR 配置文件（felin.toml [sidecar] config 或 FELIN_SIDECAR_CONFIG）".to_string())?;
+    if !path.exists() {
+        return Err(format!("OCR 配置文件不存在：{}", path.display()));
+    }
+    apply_and_write(path, &config).map_err(|e| e.to_string())
+}
+
+/// Deterministic 译文导出 into `dest_dir`: a 汉化 .txt and a 译文.csv, both
+/// recorded in the project's `exports` table.
+#[tauri::command]
+pub fn export_translations(
+    state: State<'_, AppState>,
+    dest_dir: String,
+) -> Result<TranslationExport, String> {
+    with_project(&state, |p| p.db.export_translations(Path::new(&dest_dir)))
+}
+
+// ----- project small glossary (self-contained, travels with the archive) ----
+
+/// List the project's small-glossary entries, optionally filtered by a
+/// free-text query (matches japanese/chinese/english/tags/aliases).
+#[tauri::command]
+pub fn list_glossary_entries(
+    state: State<'_, AppState>,
+    q: Option<String>,
+) -> Result<Vec<GlossaryEntry>, String> {
+    with_project(&state, |p| p.db.list_glossary_entries(q.as_deref()))
+}
+
+/// Add an entry to the project's small glossary (upsert by japanese). When
+/// `name_global_id` is given (a "from global search add"), the global entry's
+/// aliases are copied so the project archive stays self-contained.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn add_glossary_entry(
+    state: State<'_, AppState>,
+    name_global_id: Option<i64>,
+    japanese: String,
+    chinese: Option<String>,
+    english: Option<String>,
+    category: Option<String>,
+    tags: Vec<String>,
+    aliases: Vec<String>,
+    notes: Option<String>,
+) -> Result<i64, String> {
+    let guard = state.project_guard();
+    let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
+    let mut aliases = aliases;
+    if let Some(gid) = name_global_id {
+        state
+            .global
+            .get_name(gid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "global entry not found".to_string())?;
+        for a in state.global.aliases_for(gid).map_err(|e| e.to_string())? {
+            if !aliases.contains(&a) {
+                aliases.push(a);
+            }
+        }
+    }
+    proj.db
+        .insert_glossary_entry(
+            name_global_id,
+            &japanese,
+            chinese.as_deref(),
+            english.as_deref(),
+            category.as_deref(),
+            &tags,
+            &aliases,
+            notes.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn update_glossary_entry(
+    state: State<'_, AppState>,
+    id: i64,
+    japanese: String,
+    chinese: Option<String>,
+    english: Option<String>,
+    category: Option<String>,
+    tags: Vec<String>,
+    aliases: Vec<String>,
+    notes: Option<String>,
+) -> Result<(), String> {
+    with_project(&state, |p| {
+        p.db.update_glossary_entry(
+            id,
+            &japanese,
+            chinese.as_deref(),
+            english.as_deref(),
+            category.as_deref(),
+            &tags,
+            &aliases,
+            notes.as_deref(),
+        )
+    })
+}
+
+/// Toggle whether an entry is injected into translation prompts.
+#[tauri::command]
+pub fn set_entry_enabled(
+    state: State<'_, AppState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.set_entry_enabled(id, enabled))
+}
+
+/// Replace an entry's tag array wholesale.
+#[tauri::command]
+pub fn set_entry_tags(
+    state: State<'_, AppState>,
+    id: i64,
+    tags: Vec<String>,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.set_entry_tags(id, &tags))
+}
+
+#[tauri::command]
+pub fn delete_glossary_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    with_project(&state, |p| p.db.delete_glossary_entry(id))
+}
+
+// ----- global big glossary (shared pool, tag/enabled managed here) ----------
+
+/// List global entries; `q` filters by japanese/chinese/english/tag, empty
+/// lists everything (most-recently-updated first), capped at `limit`.
+#[tauri::command]
+pub fn list_glossary(
+    state: State<'_, AppState>,
+    q: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<GlossaryName>, String> {
+    let limit = limit.unwrap_or(500);
+    match q.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(q) => state.global.search_names(&q, limit).map_err(|e| e.to_string()),
+        None => state.global.list_names(limit).map_err(|e| e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn set_global_name_tags(
+    state: State<'_, AppState>,
+    id: i64,
+    tags: Vec<String>,
+) -> Result<(), String> {
+    state.global.set_name_tags(id, &tags).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_global_name_enabled(
+    state: State<'_, AppState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    state.global.set_name_enabled(id, enabled).map_err(|e| e.to_string())
+}
+
+/// Round-trip one tiny translation through the configured model — the Settings
+/// page's "测试连通" button.
+#[tauri::command]
+pub async fn test_llm_connection(state: State<'_, AppState>) -> Result<(), String> {
+    let cfg = {
+        let guard = state.project_guard();
+        let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
+        load_llm_config(&proj.db, &state.config.llm)?
+    };
+    let client = LlmClient::new(cfg).map_err(|e| e.to_string())?;
+    let req = TranslateRequest {
+        system: "你是连接测试助手。请只回复两个字：通过。".into(),
+        instruction: None,
+        glossary: None,
+        context: None,
+        source: "连接测试".into(),
+    };
+    client.translate(&req).await.map_err(|e| format!("LLM 连接测试失败：{e}"))?;
+    Ok(())
+}
+
+
 /// (Re-)segment the open project: clean text, detect chapters, rebuild TUs.
 /// `block_size` is the soft target block size (characters); when given it is
 /// saved on the project and reused next time, else the saved/default value is used.
@@ -328,8 +901,22 @@ pub fn import_ocr(
 ) -> Result<String, String> {
     // Fast-fail synchronously so the error is the invoke rejection (before any
     // task_id / events exist), not a phantom event the frontend can't match.
-    if !state.sidecar.exists() {
-        return Err(format!("OCR sidecar not found at {}", state.sidecar.display()));
+    let sidecar = state.sidecar.clone().ok_or_else(|| {
+        "OCR sidecar not configured: set [sidecar] bin in felin.toml or FELIN_SIDECAR to the ocr-cli binary"
+            .to_string()
+    })?;
+    if !sidecar.exists() {
+        return Err(format!("OCR sidecar not found at {}", sidecar.display()));
+    }
+    // `extract` handles a single PDF or image file; an image *folder* goes
+    // through the batch flow (rule matching + scan preview + staging).
+    let input_path = Path::new(&input);
+    if input_path.is_dir() {
+        return Err(
+            "input is a directory: use 图片目录导入 (import_images_batch) for image folders; \
+             extract handles a single PDF or image file"
+                .to_string(),
+        );
     }
     // Capture a handle to *this* project (db + root together, under one lock) so
     // ingest targets it even if the user switches/closes the open project mid-import.
@@ -353,10 +940,24 @@ pub fn import_ocr(
     let (tx, rx) = watch::channel(false);
     state.tasks_guard().insert(task_id.clone(), tx);
 
+    // Pass the user-configured sidecar config (felin.toml / env) when present.
+    // A config that was configured but is missing is a hard error (found-but-
+    // silently-dropped would make ocr-cli fall back to its own default and die
+    // with a cryptic exit 20); `None` means "let ocr-cli find its own config".
+    let config = match &state.sidecar_config {
+        Some(p) if !p.exists() => {
+            return Err(format!(
+                "OCR sidecar config set at {} but not found",
+                p.display()
+            ))
+        }
+        other => other.clone(),
+    };
+
     let args = ExtractArgs {
-        sidecar: state.sidecar.clone(),
+        sidecar,
         input: PathBuf::from(&input),
-        config: None,
+        config,
         out_dir,
         manifest,
         pages,
@@ -479,6 +1080,292 @@ pub fn cancel_import(state: State<'_, AppState>, task_id: String) -> Result<(), 
         }
         None => Err(format!("no active import task '{task_id}'")),
     }
+}
+
+// ----- image-directory import (ocr-cli batch, app-side selection) -----------
+
+/// Preview which images in `dir` match `rule`, in natural reading order —
+/// what the import card shows before the user commits to the batch run.
+#[tauri::command]
+pub fn scan_image_dir(dir: String, rule: ImageMatchRule) -> Result<FileSelection, String> {
+    let dir = PathBuf::from(&dir);
+    let matched = select_images(&dir, &rule).map_err(|e| e.to_string())?;
+    // The default rule (preset All, no glob/regex/range) = every image file.
+    let total = select_images(&dir, &ImageMatchRule::default())
+        .map_err(|e| e.to_string())?
+        .len();
+    let names = matched
+        .iter()
+        .filter_map(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect();
+    let bytes = matched.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    Ok(FileSelection { total, matched: matched.len(), names, bytes })
+}
+
+/// Stage the selected images into `staged_dir` under their original names so
+/// `batch` only ever sees the *selected* files — a PDF mixed into an image
+/// folder is never staged and never processed (non-expected input = skip).
+/// Unix prefers a symlink; falls back to a hard link, then a byte copy.
+fn stage_images(files: &[PathBuf], staged_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(staged_dir).map_err(|e| e.to_string())?;
+    for f in files {
+        let name = f
+            .file_name()
+            .ok_or_else(|| format!("cannot derive file name from {}", f.display()))?;
+        let target = staged_dir.join(name);
+        #[cfg(unix)]
+        if std::os::unix::fs::symlink(f, &target).is_ok() {
+            continue;
+        }
+        if std::fs::hard_link(f, &target).is_ok() {
+            continue;
+        }
+        std::fs::copy(f, &target).map_err(|e| format!("cannot stage {}: {e}", f.display()))?;
+    }
+    Ok(())
+}
+
+/// Import the images in `dir` that match `rule` via the `ocr-cli batch`
+/// sidecar. Returns a `task_id` immediately; progress arrives over the same
+/// `ocr://progress` / `ocr://done` / `ocr://error` events as [`import_ocr`],
+/// and the import can be cancelled with [`cancel_import`]. The images are
+/// staged into `<project>/ocr/<task>/inputs/` (symlinks), the txt/json
+/// outputs land in `<project>/ocr/<task>/`, paragraphs are ingested into a
+/// chapter named after the directory, and the staging dir is removed.
+#[tauri::command]
+pub fn import_images_batch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dir: String,
+    rule: ImageMatchRule,
+) -> Result<String, String> {
+    let sidecar = state.sidecar.clone().ok_or_else(|| {
+        "OCR sidecar not configured: set [sidecar] bin in felin.toml or FELIN_SIDECAR to the ocr-cli binary"
+            .to_string()
+    })?;
+    if !sidecar.exists() {
+        return Err(format!("OCR sidecar not found at {}", sidecar.display()));
+    }
+    let dir_path = PathBuf::from(&dir);
+    if !dir_path.is_dir() {
+        return Err(format!("not a directory: {}", dir_path.display()));
+    }
+    // Selection happens app-side (batch has no pattern/range flag): only the
+    // matched images are staged, so a mixed-in PDF is skipped outright.
+    let files = select_images(&dir_path, &rule).map_err(|e| e.to_string())?;
+    if files.is_empty() {
+        return Err("no images in the directory matched the selection rule".into());
+    }
+    // Capture everything the run thread needs under the project lock.
+    let (db, root, chapter_title, ocr_settings) = {
+        let guard = state.project_guard();
+        let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
+        let title = dir_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "图片导入".to_string());
+        let settings = proj.db.get_ocr_settings().map_err(|e| e.to_string())?;
+        (Arc::clone(&proj.db), proj.root.clone(), title, settings)
+    };
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let out_dir = root.join("ocr").join(&task_id);
+    let staged = out_dir.join("inputs");
+    if let Err(e) = stage_images(&files, &staged) {
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return Err(e);
+    }
+
+    let config = match &state.sidecar_config {
+        Some(p) if !p.exists() => {
+            return Err(format!(
+                "OCR sidecar config set at {} but not found",
+                p.display()
+            ))
+        }
+        other => other.clone(),
+    };
+    let args = BatchArgs {
+        sidecar,
+        input_dir: staged,
+        config,
+        out_dir: out_dir.clone(),
+        workers: Some(ocr_settings.batch_workers.clamp(1, 16) as u32),
+        recursive: ocr_settings.batch_recursive,
+        skip_existing: false,
+        save_json: true,
+        envs: vec![],
+    };
+
+    let (tx, rx) = watch::channel(false);
+    state.tasks_guard().insert(task_id.clone(), tx);
+    let threshold = state.config.ocr.low_score_threshold;
+    let enders = state.config.sentence_enders();
+
+    let app_thread = app.clone();
+    let tid = task_id.clone();
+    std::thread::spawn(move || {
+        // RAII: always deregister the cancel handle, on every exit path.
+        struct Dereg {
+            app: AppHandle,
+            tid: String,
+        }
+        impl Drop for Dereg {
+            fn drop(&mut self) {
+                if let Some(st) = self.app.try_state::<AppState>() {
+                    st.tasks_guard().remove(&self.tid);
+                }
+            }
+        }
+        let _dereg = Dereg { app: app_thread.clone(), tid: tid.clone() };
+
+        let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = app_thread.emit(
+                    "ocr://error",
+                    ErrorPayload { task_id: tid, message: format!("could not start runtime: {e}") },
+                );
+                return;
+            }
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(run_batch_import(
+                &app_thread,
+                &tid,
+                &args,
+                files,
+                db,
+                chapter_title,
+                threshold,
+                enders,
+                rx,
+            ))
+        }));
+        match result {
+            Ok(Ok(r)) => {
+                let _ = app_thread.emit("ocr://done", r);
+            }
+            Ok(Err(message)) => {
+                let _ = app_thread.emit("ocr://error", ErrorPayload { task_id: tid.clone(), message });
+            }
+            Err(_) => {
+                let _ = app_thread.emit(
+                    "ocr://error",
+                    ErrorPayload { task_id: tid.clone(), message: "import task panicked".into() },
+                );
+            }
+        }
+    });
+
+    Ok(task_id)
+}
+
+/// Async body of an image-directory import: stream the batch sidecar, ingest
+/// the per-image txt outputs (with score metadata) into the captured project,
+/// then remove the staging directory.
+async fn run_batch_import(
+    app: &AppHandle,
+    task_id: &str,
+    args: &BatchArgs,
+    files: Vec<PathBuf>,
+    db: Arc<ProjectDb>,
+    chapter_title: String,
+    low_score_threshold: f64,
+    sentence_enders: Vec<char>,
+    rx: watch::Receiver<bool>,
+) -> Result<ImportResult, String> {
+    let total = files.len() as i64;
+    let app_prog = app.clone();
+    let tid = task_id.to_string();
+    let _ = app_prog.emit(
+        "ocr://progress",
+        ProgressPayload {
+            task_id: tid.clone(),
+            event: ProgressEvent::Start { source: chapter_title.clone(), pages_total: total },
+        },
+    );
+
+    let mut ok: usize = 0;
+    let mut failed: usize = 0;
+    let mut failed_pages: Vec<i64> = Vec::new();
+    // A clone of the cancel flag outlives `run_batch` (which consumes `rx`),
+    // so after the run we can tell a cancellation from normal completion.
+    let cancel_probe = rx.clone();
+    run_batch(
+        args,
+        |ev| {
+            let done = ok + failed + 1;
+            let (status, error) = match ev {
+                BatchEvent::Done { .. } => {
+                    ok += 1;
+                    (PageStatus::Ok, None)
+                }
+                BatchEvent::Failed { error, .. } => {
+                    failed += 1;
+                    failed_pages.push(done as i64);
+                    (PageStatus::Failed, Some(error))
+                }
+            };
+            let _ = app_prog.emit(
+                "ocr://progress",
+                ProgressPayload {
+                    task_id: tid.clone(),
+                    event: ProgressEvent::Page {
+                        page: done as i64,
+                        status,
+                        score: None,
+                        error,
+                        done: done as i64,
+                        total,
+                    },
+                },
+            );
+        },
+        rx,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    // `run_batch` returns Ok on both normal completion and cancellation; the
+    // watch value distinguishes the two.
+    let cancelled = *cancel_probe.borrow();
+    let outcome = if cancelled {
+        "cancelled"
+    } else if failed > 0 {
+        "partial"
+    } else {
+        "all_ok"
+    };
+    let _ = app_prog.emit(
+        "ocr://progress",
+        ProgressPayload {
+            task_id: tid.clone(),
+            event: ProgressEvent::Done { pages_ok: ok as i64, pages_failed: failed as i64, manifest: None },
+        },
+    );
+
+    // Each matched image produced `<out>/<stem>.txt`; assemble paragraphs (a
+    // failed image has no txt and is skipped by the ingest).
+    let paras =
+        ingest_batch_txts(&files, &args.out_dir, low_score_threshold, &sentence_enders)
+            .map_err(|e| e.to_string())?;
+    let ch = db.get_or_create_chapter(&chapter_title).map_err(|e| e.to_string())?;
+    db.insert_paragraphs(ch, &paras).map_err(|e| e.to_string())?;
+
+    // The staging inputs were only for `batch`; remove them now that the txts
+    // are ingested (the txt/json outputs in `out_dir` are kept like `extract`).
+    let _ = std::fs::remove_dir_all(&args.input_dir);
+
+    Ok(ImportResult {
+        task_id: task_id.to_string(),
+        outcome: outcome.to_string(),
+        pages_ok: ok,
+        pages_failed: failed,
+        failed_pages,
+        paragraphs: paras.len(),
+        chapter_id: ch,
+    })
 }
 
 // PLACEHOLDER_ARCHIVE
@@ -630,16 +1517,36 @@ pub fn csv_headers(state: State<'_, AppState>, path: String) -> Result<Vec<Strin
     names::csv::headers(&data).map_err(|e| e.to_string())
 }
 
+/// Import a glossary CSV. `target` = `"project"` (project small glossary) or
+/// `"global"` (shared big glossary). Project-target rows are ALSO upserted into
+/// the global pool (accumulating the shared glossary) with a source tag naming
+/// the project.
 #[tauri::command]
 pub fn import_glossary_csv(
     state: State<'_, AppState>,
     path: String,
     mapping: CsvMapping,
+    target: String,
 ) -> Result<usize, String> {
     let data = read_regular_capped(Path::new(&path), state.config.import.max_file_bytes)?;
     let rows = names::csv::parse(&data, &mapping.into_core()).map_err(|e| e.to_string())?;
+    let to_project = match target.as_str() {
+        "project" => true,
+        "global" => false,
+        other => return Err(format!("unknown glossary target: {other}")),
+    };
+    let guard = state.project_guard();
+    let proj = guard.as_ref();
+    if to_project && proj.is_none() {
+        return Err("no project is open".into());
+    }
     let mut n = 0;
     for row in &rows {
+        let source = if to_project {
+            format!("project:{}", proj.unwrap().slug)
+        } else {
+            "imported".to_string()
+        };
         let id = state
             .global
             .upsert_name_full(
@@ -648,22 +1555,43 @@ pub fn import_glossary_csv(
                 row.english.as_deref(),
                 row.category.as_deref(),
                 row.notes.as_deref(),
-                "imported",
+                &source,
                 NameStatus::Imported,
             )
             .map_err(|e| e.to_string())?;
         for a in &row.aliases {
             state.global.add_alias(id, a).map_err(|e| e.to_string())?;
         }
+        if to_project {
+            // Carry over any existing global tags plus the source-project tag.
+            let mut tags: Vec<String> = state
+                .global
+                .get_name(id)
+                .map_err(|e| e.to_string())?
+                .map(|g| g.tags)
+                .unwrap_or_default();
+            if !tags.contains(&source) {
+                tags.push(source.clone());
+            }
+            state.global.set_name_tags(id, &tags).map_err(|e| e.to_string())?;
+            let p = proj.unwrap();
+            p.db.insert_glossary_entry(
+                Some(id),
+                &row.japanese,
+                Some(&row.chinese),
+                row.english.as_deref(),
+                row.category.as_deref(),
+                &tags,
+                &row.aliases,
+                row.notes.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
         n += 1;
     }
     Ok(n)
 }
 
-#[tauri::command]
-pub fn list_glossary(state: State<'_, AppState>, limit: Option<i64>) -> Result<Vec<GlossaryName>, String> {
-    state.global.list_names(limit.unwrap_or(500)).map_err(|e| e.to_string())
-}
 
 // PLACEHOLDER_NAMES_REVIEW
 
@@ -737,10 +1665,22 @@ pub fn reject_extracted(state: State<'_, AppState>, id: i64) -> Result<(), Strin
     with_project(&state, |p| p.db.set_extracted_status(id, ExtractedNameStatus::Rejected, None))
 }
 
-/// Confirm a candidate: upsert it into the global glossary (source = this
-/// project, status draft) and mark the candidate confirmed + linked.
+/// Confirm a candidate into a glossary. `target` = `"project"` (project small
+/// glossary) or `"global"` (shared big glossary). Either way the candidate is
+/// upserted into the global pool too (accumulating the shared glossary, with a
+/// source tag naming this project); `"project"` additionally copies it into the
+/// project's self-contained small glossary.
 #[tauri::command]
-pub fn confirm_extracted(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+pub fn confirm_extracted(
+    state: State<'_, AppState>,
+    id: i64,
+    target: String,
+) -> Result<(), String> {
+    let to_project = match target.as_str() {
+        "project" => true,
+        "global" => false,
+        other => return Err(format!("unknown glossary target: {other}")),
+    };
     let guard = state.project_guard();
     let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
     let cand = proj
@@ -761,6 +1701,32 @@ pub fn confirm_extracted(state: State<'_, AppState>, id: i64) -> Result<(), Stri
             NameStatus::Draft,
         )
         .map_err(|e| e.to_string())?;
+    // Carry the existing global tags forward and stamp the source project.
+    let mut tags: Vec<String> = state
+        .global
+        .get_name(name_id)
+        .map_err(|e| e.to_string())?
+        .map(|g| g.tags)
+        .unwrap_or_default();
+    if !tags.contains(&source) {
+        tags.push(source.clone());
+    }
+    state.global.set_name_tags(name_id, &tags).map_err(|e| e.to_string())?;
+    if to_project {
+        let global_aliases = state.global.aliases_for(name_id).map_err(|e| e.to_string())?;
+        proj.db
+            .insert_glossary_entry(
+                Some(name_id),
+                &cand.japanese,
+                cand.candidate_chinese.as_deref(),
+                None,
+                None,
+                &tags,
+                &global_aliases,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+    }
     proj.db
         .set_extracted_status(id, ExtractedNameStatus::Confirmed, Some(name_id))
         .map_err(|e| e.to_string())?;

@@ -27,6 +27,9 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("CSV error: {0}")]
+    Csv(#[from] csv::Error),
+
     /// A migration step failed; the transaction was rolled back.
     #[error("migration failed at version {version}: {message}")]
     Migration { version: i64, message: String },
@@ -47,6 +50,10 @@ pub enum Error {
     /// The OCR sidecar could not be spawned or its I/O failed.
     #[error("OCR sidecar error: {detail}")]
     Sidecar { detail: String },
+
+    /// The ocr-router config.yaml could not be parsed or written back.
+    #[error("OCR config error: {detail}")]
+    OcrConfig { detail: String },
 
     /// The OCR sidecar exited with a hard/fatal status (exit code 20): no
     /// usable output was produced. Distinct from a *partial* success (exit 10),
@@ -86,6 +93,10 @@ impl Error {
 
     pub(crate) fn sidecar(detail: impl Into<String>) -> Self {
         Error::Sidecar { detail: detail.into() }
+    }
+
+    pub(crate) fn ocr_config(detail: impl Into<String>) -> Self {
+        Error::OcrConfig { detail: detail.into() }
     }
 
     pub(crate) fn contract(detail: impl Into<String>) -> Self {

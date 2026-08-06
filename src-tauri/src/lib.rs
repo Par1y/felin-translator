@@ -37,18 +37,49 @@ pub fn run() {
             commands::import_txt_file,
             commands::import_ocr,
             commands::cancel_import,
+            commands::scan_image_dir,
+            commands::import_images_batch,
             commands::export_project,
             commands::import_project,
             commands::get_llm_config,
             commands::set_llm_config,
+            commands::test_llm_connection,
             commands::csv_headers,
             commands::import_glossary_csv,
             commands::list_glossary,
+            commands::set_global_name_tags,
+            commands::set_global_name_enabled,
             commands::run_name_extraction,
             commands::list_extracted,
             commands::update_extracted,
             commands::reject_extracted,
             commands::confirm_extracted,
+            commands::start_translation,
+            commands::stop_translation,
+            commands::translation_status,
+            commands::retry_translation,
+            commands::approve_tu,
+            commands::set_tu_instruction,
+            commands::retranslate_tu,
+            commands::retranslate_tus,
+            commands::get_translation_settings,
+            commands::set_translation_settings,
+            commands::get_guidelines,
+            commands::set_guidelines,
+            commands::list_tus_with_translations,
+            commands::set_tu_source,
+            commands::set_translation_text,
+            commands::get_ocr_settings,
+            commands::set_ocr_settings,
+            commands::get_ocr_config,
+            commands::set_ocr_config,
+            commands::export_translations,
+            commands::list_glossary_entries,
+            commands::add_glossary_entry,
+            commands::update_glossary_entry,
+            commands::set_entry_enabled,
+            commands::set_entry_tags,
+            commands::delete_glossary_entry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Felin Translator");
@@ -70,12 +101,41 @@ fn build_state() -> Result<AppState, Box<dyn std::error::Error>> {
         },
     )?;
 
-    let sidecar =
-        paths::resolve_sidecar().unwrap_or_else(|_| std::path::PathBuf::from(paths::SIDECAR_BIN));
-    if !sidecar.exists() {
+    // Sidecar path is user-managed: `[sidecar] bin` in felin.toml, or
+    // `FELIN_SIDECAR` for dev. No guessed fallback — if it's unset or missing,
+    // OCR import reports a clear error. `mock-ocr-cli` is never used here
+    // (automated tests only).
+    let sidecar = paths::resolve_sidecar(config.sidecar.bin.as_deref());
+    match &sidecar {
+        Some(p) if !p.exists() => {
+            tracing::warn!(
+                path = %p.display(),
+                "OCR sidecar not found (set [sidecar] bin in felin.toml or FELIN_SIDECAR); OCR import will fail"
+            );
+        }
+        None => {
+            tracing::warn!(
+                "OCR sidecar not configured (set [sidecar] bin in felin.toml or FELIN_SIDECAR); OCR import will fail"
+            );
+        }
+        _ => {}
+    }
+    let sidecar_config = paths::resolve_sidecar_config(config.sidecar.config.as_deref());
+    if let Some(p) = &sidecar_config {
+        if !p.exists() {
+            tracing::warn!(
+                path = %p.display(),
+                "OCR sidecar config not found; ocr-cli will use its own default (likely fatal)"
+            );
+        }
+    }
+    // A configured sidecar with no config at all is the classic exit-20 trap:
+    // ocr-cli looks for its own `config.yaml` in the working directory and dies
+    // if absent. Surface it at startup rather than at import time.
+    if sidecar.is_some() && sidecar_config.is_none() {
         tracing::warn!(
-            path = %sidecar.display(),
-            "OCR sidecar not found next to the executable; OCR import will fail until it is bundled"
+            "OCR sidecar configured but no sidecar config ([sidecar] config / FELIN_SIDECAR_CONFIG); \
+             ocr-cli will look for its own config.yaml and likely fail with exit 20"
         );
     }
 
@@ -84,8 +144,10 @@ fn build_state() -> Result<AppState, Box<dyn std::error::Error>> {
         config,
         global,
         sidecar,
+        sidecar_config,
         project: Mutex::new(None),
         tasks: Mutex::new(HashMap::new()),
+        translation: Mutex::new(None),
     })
 }
 
@@ -101,7 +163,10 @@ fn load_tech_config(dir: &std::path::Path) -> felin_core::config::TechConfig {
         }),
         Err(_) => {
             let c = TechConfig::default();
-            if let Err(e) = std::fs::write(&path, c.to_toml_string()) {
+            // Write the self-documenting template (commented guidance, incl. the
+            // user-managed `[sidecar] bin`/`config` keys) so advanced users can
+            // discover and edit it; only ever written when the file is missing.
+            if let Err(e) = std::fs::write(&path, TechConfig::default_template()) {
                 tracing::warn!(error = %e, "could not write default felin.toml");
             }
             c

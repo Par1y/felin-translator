@@ -222,3 +222,189 @@ fn segment_cleans_detects_chapters_and_builds_tus() {
     // The TU references the surviving paragraphs' UUIDs.
     assert_eq!(tus1[0].paragraph_ids[0], c1[0].id);
 }
+
+#[test]
+fn small_glossary_crud_and_matcher_filters_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+
+    let id = p
+        .insert_glossary_entry(None, "田中", Some("田中"), None, None, &["人名".into()], &["たなか".into()], None)
+        .unwrap();
+    let entries = p.list_glossary_entries(None).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].chinese.as_deref(), Some("田中"));
+    assert_eq!(entries[0].tags, vec!["人名"]);
+    assert_eq!(entries[0].aliases, vec!["たなか"]);
+    assert!(entries[0].enabled);
+
+    // Upsert by japanese refreshes the value fields wholesale (tags/aliases
+    // replaced with what the caller passes), keeps the row and id.
+    let again = p
+        .insert_glossary_entry(
+            Some(7),
+            "田中",
+            Some("Tanaka"),
+            None,
+            None,
+            &["人名".into(), "专名".into()],
+            &["たなか".into(), "中".into()],
+            Some("注"),
+        )
+        .unwrap();
+    assert_eq!(id, again);
+    let entries = p.list_glossary_entries(None).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].chinese.as_deref(), Some("Tanaka"));
+    assert_eq!(entries[0].name_global_id, Some(7));
+    assert_eq!(entries[0].tags, vec!["人名", "专名"]);
+
+    // Aliases + japanese feed the matcher; disabled entries are excluded.
+    assert_eq!(p.matcher_entries().unwrap().len(), 1);
+    p.set_entry_enabled(id, false).unwrap();
+    assert!(p.matcher_entries().unwrap().is_empty(), "disabled entries never reach the matcher");
+    p.set_entry_enabled(id, true).unwrap();
+
+    // Tag set + free-text search.
+    p.set_entry_tags(id, &["地名".into(), "历史".into()]).unwrap();
+    assert_eq!(p.list_glossary_entries(Some("历史")).unwrap().len(), 1);
+    assert_eq!(p.list_glossary_entries(Some("不存在")).unwrap().len(), 0);
+    // Search hits aliases too.
+    p.update_glossary_entry(id, "田中", Some("田中"), None, None, &["人名".into()], &["たなか".into(), "中".into()], None)
+        .unwrap();
+    assert_eq!(p.list_glossary_entries(Some("たなか")).unwrap().len(), 1);
+    assert_eq!(p.list_glossary_entries(Some("中")).unwrap().len(), 1);
+
+    p.delete_glossary_entry(id).unwrap();
+    assert!(p.list_glossary_entries(None).unwrap().is_empty());
+}
+
+#[test]
+fn source_override_and_editable_translation() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let ch = p.get_or_create_chapter("c").unwrap();
+    let para = IngestedParagraph::new(
+        "原文段落。".into(),
+        None,
+        "b.pdf".into(),
+        None,
+        OcrParagraphStatus::Ok,
+        serde_json::Value::Null,
+    );
+    p.insert_paragraphs(ch, &[para.clone()]).unwrap();
+    let tu = p
+        .db()
+        .write(|c| {
+            c.execute(
+                "INSERT INTO tus (chapter_id, paragraph_ids, ord, budget, status)
+                 VALUES (?1, ?2, 0, NULL, 'translated')",
+                rusqlite::params![ch, serde_json::to_string(&vec![para.id.to_string()]).unwrap()],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .unwrap();
+
+    // Concatenated paragraphs are the default source; the override wins verbatim.
+    assert_eq!(p.tu_source(tu).unwrap(), "原文段落。");
+    p.set_tu_source(tu, "用户改写的原文").unwrap();
+    assert_eq!(p.tu_source(tu).unwrap(), "用户改写的原文");
+    // list_tus_with_translations resolves the same effective source.
+    let listed = p.list_tus_with_translations(ch).unwrap();
+    assert_eq!(listed[0].source, "用户改写的原文");
+    // Clearing the override falls back to the paragraphs.
+    p.set_tu_source(tu, "   ").unwrap();
+    assert_eq!(p.tu_source(tu).unwrap(), "原文段落。");
+
+    // Editing the translation text demotes an approved TU to reviewing.
+    p.approve_tu(tu).unwrap();
+    let demoted = p.set_translation_text(tu, "手工译文").unwrap();
+    assert!(demoted, "approve → reviewing on edit");
+    assert_eq!(p.get_tu(tu).unwrap().unwrap().status, felin_core::types::TuStatus::Reviewing);
+    let t = p.get_translation(tu).unwrap().unwrap();
+    assert_eq!(t.final_text.as_deref(), Some("手工译文"));
+    assert_eq!(t.status, felin_core::types::TranslationStatus::Draft);
+
+    // Batch retranslate stamps instructions and requeues.
+    let n = p.retranslate_tus(&[tu], Some("重新翻译，注意敬语")).unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(p.get_tu(tu).unwrap().unwrap().status, felin_core::types::TuStatus::Queued);
+    assert_eq!(
+        p.get_translation(tu).unwrap().unwrap().instruction.as_deref(),
+        Some("重新翻译，注意敬语")
+    );
+}
+
+#[test]
+fn export_translations_is_deterministic_and_records_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let ch_a = p.get_or_create_chapter("第一章 出会い").unwrap();
+    let ch_b = p.get_or_create_chapter("第二章 別れ").unwrap();
+
+    // Two translated TUs in chapter A, one empty (excluded), one in chapter B.
+    let mk_tu = |ch: i64, ord: i64, final_text: Option<&str>| {
+        let para = IngestedParagraph::new(
+            format!("原文{ord}。"),
+            None,
+            "b.pdf".into(),
+            None,
+            OcrParagraphStatus::Ok,
+            serde_json::Value::Null,
+        );
+        p.insert_paragraphs(ch, &[para.clone()]).unwrap();
+        let tu = p
+            .db()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO tus (chapter_id, paragraph_ids, ord, budget, status)
+                     VALUES (?1, ?2, ?3, NULL, 'approved')",
+                    rusqlite::params![ch, serde_json::to_string(&vec![para.id.to_string()]).unwrap(), ord],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .unwrap();
+        if let Some(text) = final_text {
+            p.set_translation_text(tu, text).unwrap();
+        }
+    };
+    mk_tu(ch_a, 0, Some("第一句译文。"));
+    mk_tu(ch_a, 1, Some("第二句译文。"));
+    mk_tu(ch_a, 2, None); // empty final_text → excluded
+    mk_tu(ch_b, 0, Some("第二章译文。"));
+
+    let dest = dir.path().join("export");
+    let out = p.export_translations(&dest).unwrap();
+    assert_eq!(out.tus, 3);
+
+    let txt = std::fs::read_to_string(&out.txt_path).unwrap();
+    assert_eq!(
+        txt,
+        "# 第一章 出会い\n第一句译文。\n第二句译文。\n\n# 第二章 別れ\n第二章译文。\n\n"
+    );
+    let csv = std::fs::read_to_string(&out.csv_path).unwrap();
+    let rows: Vec<&str> = csv.lines().collect();
+    assert_eq!(rows[0], "章号,章节标题,序号,原文,译文,状态");
+    assert_eq!(rows[1], "0,第一章 出会い,0,原文0。,第一句译文。,approved");
+    assert_eq!(rows[2], "0,第一章 出会い,1,原文1。,第二句译文。,approved");
+    assert_eq!(rows[3], "1,第二章 別れ,0,原文0。,第二章译文。,approved");
+    // Both paths were recorded in the exports table.
+    let n: i64 = p
+        .db()
+        .read(|c| Ok(c.query_row("SELECT COUNT(*) FROM exports", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn ocr_settings_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let d = p.get_ocr_settings().unwrap();
+    assert_eq!(d.batch_workers, 4);
+    assert!(!d.batch_recursive);
+    p.set_ocr_settings(&felin_core::types::OcrSettings { batch_workers: 2, batch_recursive: true }).unwrap();
+    let back = p.get_ocr_settings().unwrap();
+    assert_eq!(back.batch_workers, 2);
+    assert!(back.batch_recursive);
+}

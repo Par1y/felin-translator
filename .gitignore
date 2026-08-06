@@ -34,3 +34,6 @@ project.lock
 # vibe
 plan.md
 PROGRESS.md
+
+# test doc
+test/

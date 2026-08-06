@@ -147,21 +147,10 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir ui install --frozen-lockfile
 
-      # --- Sidecar: build mock-ocr-cli, then stage it as the exact filename Tauri
-      #     expects for bundle.externalBin ("binaries/mock-ocr-cli" + "-<triple>"). ---
-      - name: Build and stage sidecar (mock-ocr-cli)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Host triple; tr strips the trailing CR that rustc emits under Git-bash on Windows.
-          TARGET_TRIPLE="$(rustc -Vv | grep '^host:' | cut -d' ' -f2 | tr -d '[:space:]')"
-          echo "Host target triple: $TARGET_TRIPLE"
-          cargo build -p mock-ocr-cli --release --locked
-          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; else EXT=""; fi
-          mkdir -p src-tauri/binaries
-          cp "target/release/mock-ocr-cli${EXT}" \
-             "src-tauri/binaries/mock-ocr-cli-${TARGET_TRIPLE}${EXT}"
-          ls -la src-tauri/binaries
+      # --- Sidecar: the OCR backend (ocr-cli) is user-provided via
+      #     felin.toml [sidecar] bin / FELIN_SIDECAR and is NOT bundled into the
+      #     release. mock-ocr-cli is automated-test-only and must never ship in
+      #     a production bundle, so nothing is staged for bundle.externalBin. ---
 
       # --- Tauri CLI: the repo root (tauri-action's projectPath) has no package.json,
       #     so tauri-action's package-manager auto-detection cannot find a JS `tauri`
@@ -175,18 +164,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Run from the repo root: it holds src-tauri/, and tauri.conf.json's
-          # frontendDist ("../ui/dist") + beforeBuildCommand ("pnpm --dir ui build")
-          # both resolve relative to it. beforeBuildCommand builds the frontend during
-          # `tauri build`; only the pnpm *install* is done as a step above.
+          # Run from the repo root: it holds src-tauri/. Tauri v2 runs
+          # beforeBuildCommand ("pnpm build") with cwd = the frontend directory
+          # (ui/, where ui/package.json lives); frontendDist ("../ui/dist") is
+          # resolved relative to src-tauri/. The explicit build step above is
+          # belt-and-suspenders — tauri re-runs beforeBuildCommand itself.
           projectPath: '.'
           # Use the globally installed CLI (skips tauri-action's detection, which would
           # otherwise fall back to auto-installing @tauri-apps/cli@v2 at build time).
           tauriScript: 'tauri'
           args: ${{ matrix.args }}
 
-      # Portable "green" distribution: the app binary + its sidecar in one folder
-      # (data lives next to the executable), tarred for download.
+      # Portable "green" distribution: the app binary in one folder (data lives
+      # next to the executable), tarred for download. The OCR backend (ocr-cli)
+      # is user-provided and deliberately excluded from the bundle.
       - name: Package Linux loose files (portable)
         if: matrix.platform == 'ubuntu-22.04'
         shell: bash
@@ -194,7 +185,6 @@ jobs:
           set -euo pipefail
           mkdir -p dist/felin-translator
           cp target/release/felin-translator dist/felin-translator/
-          cp target/release/mock-ocr-cli dist/felin-translator/ 2>/dev/null || true
           tar -C dist -czf felin-translator-linux-x86_64.tar.gz felin-translator
           ls -la felin-translator-linux-x86_64.tar.gz
 

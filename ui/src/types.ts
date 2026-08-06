@@ -5,6 +5,8 @@ export interface AppInfo {
   data_dir: string;
   sidecar: string;
   sidecar_present: boolean;
+  ocr_config_path: string;
+  ocr_config_present: boolean;
   glossary_names: number;
 }
 
@@ -78,7 +80,103 @@ export interface GlossaryName {
   notes: string | null;
   source: string | null;
   status: string;
+  tags: string[];
+  enabled: boolean;
 }
+
+// Mirrors felin_core::types::GlossaryEntry (project small glossary).
+export interface GlossaryEntry {
+  id: number;
+  name_global_id: number | null;
+  japanese: string;
+  chinese: string | null;
+  english: string | null;
+  category: string | null;
+  tags: string[];
+  enabled: boolean;
+  aliases: string[];
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// Input fields for add/update glossary commands (minus the row id / provenance).
+export interface GlossaryEntryInput {
+  japanese: string;
+  chinese: string | null;
+  english: string | null;
+  category: string | null;
+  tags: string[];
+  aliases: string[];
+  notes: string | null;
+}
+
+export interface AddGlossaryEntryInput extends GlossaryEntryInput {
+  name_global_id: number | null;
+}
+
+// Mirrors felin_core::types::OcrSettings (per-project batch options).
+export interface OcrSettings {
+  batch_workers: number;
+  batch_recursive: boolean;
+}
+
+// Mirrors felin_core::ocr::config (the app-editable slice of ocr-router's
+// config.yaml, edited in place).
+export interface OcrProviderConfig {
+  name: string;
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+  api_key: string;
+}
+
+export interface OcrEvaluatorConfig {
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+  api_key: string;
+}
+
+export interface OcrConfig {
+  providers: OcrProviderConfig[];
+  order: string[];
+  evaluator: OcrEvaluatorConfig;
+}
+
+// Mirrors felin_core::types::FileSelection (image-dir scan preview).
+export interface FileSelection {
+  total: number;
+  matched: number;
+  names: string[];
+  bytes: number;
+}
+
+// Mirrors felin_core::types::TranslationExport (deterministic 译文导出).
+export interface TranslationExport {
+  txt_path: string;
+  csv_path: string;
+  tus: number;
+}
+
+// Mirrors felin_core::ocr::select::ImagePreset (serde snake_case).
+export type ImagePreset = "all" | "png" | "jpg" | "numbered" | "numbered_prefix";
+
+// Mirrors felin_core::ocr::select::ImageMatchRule.
+export interface ImageMatchRule {
+  preset: ImagePreset;
+  custom_glob: string | null;
+  custom_regex: string | null;
+  /** Inclusive 1-based page range in natural reading order; null = no cut. */
+  range: [number, number] | null;
+}
+
+export const DEFAULT_IMAGE_RULE: ImageMatchRule = {
+  preset: "all",
+  custom_glob: null,
+  custom_regex: null,
+  range: null,
+};
 
 export interface ExtractedName {
   id: number;
@@ -127,4 +225,62 @@ export interface ProgressPayload {
 export interface ErrorPayload {
   task_id: string;
   message: string;
+}
+
+// ----- translation pipeline (plan step 8) ----------------------------------
+
+// Mirrors felin_core::pipeline::PipelineEvent (tagged by "event").
+export type PipelineEvent =
+  | { event: "started"; total_tus: number }
+  | { event: "tu_start"; tu_id: number }
+  | { event: "tu_done"; tu_id: number; memory_hit: boolean }
+  | { event: "tu_failed"; tu_id: number; error: string }
+  | { event: "stopped" }
+  | { event: "finished"; total_tus: number };
+
+export interface TranslationProgressPayload {
+  task_id: string;
+  event: PipelineEvent;
+}
+
+export interface TranslationDonePayload {
+  task_id: string;
+}
+
+// Mirrors felin_core::types::TranslationSettings (per-project GUI options).
+export interface TranslationSettings {
+  workers: number;
+  window: number;
+  memory_dedup: boolean;
+  stop_aborts_inflight: boolean;
+}
+
+export interface StatusCount {
+  status: string;
+  count: number;
+}
+
+export interface TranslationStatusView {
+  running: boolean;
+  task_id: string | null;
+  workers: number;
+  window: number;
+  active_chapters: number[];
+  counts: StatusCount[];
+}
+
+// Mirrors felin_core::types::TuWithTranslation.
+export interface TuWithTranslation {
+  id: number;
+  ord: number;
+  budget: number | null;
+  status: string;
+  translation_status: string | null;
+  /** Effective source: the user's source_override if set, else the paragraphs. */
+  source: string;
+  final_text: string | null;
+  llm_text: string | null;
+  instruction: string | null;
+  error: string | null;
+  source_hash: string | null;
 }
