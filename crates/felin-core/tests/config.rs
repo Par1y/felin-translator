@@ -17,6 +17,7 @@ fn default_roundtrips_through_toml() {
     assert_eq!(back.seg.sentence_enders, felin_core::config::DEFAULT_SENTENCE_ENDERS);
     assert_eq!(back.seg.chapter_heading_patterns, vec![felin_core::config::DEFAULT_CHAPTER_PATTERN.to_string()]);
     assert_eq!(back.llm.max_retries, 3);
+    assert_eq!(back.llm.concurrency, 2, "[llm] concurrency default is the global LLM cap");
     assert_eq!(back.pipeline.queue_capacity, 64);
     assert_eq!(back.pipeline.context_max_chars, 4000);
 }
@@ -183,20 +184,57 @@ fn load_from_disk_heals_legacy_file_missing_prompt_section() {
     assert!(!written2);
 }
 
-/// A file that already has `[prompt]` is never touched — a user's custom
-/// templates are honored verbatim and no append happens.
+/// A file that already has `[prompt]` with all four keys is never touched — a
+/// user's custom templates are honored verbatim and no append happens.
 #[test]
 fn load_from_disk_leaves_existing_prompt_untouched() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("felin.toml");
-    let text = "[prompt]\nextract_system = \"自定义抽取\"\n[llm]\ntimeout_secs = 9\n";
+    let text = "[prompt]\nextract_system = \"自定义抽取\"\nextract_tags_system = \"我的分类\"\n[llm]\ntimeout_secs = 9\n";
     fs::write(&path, text).unwrap();
 
     let (cfg, written) = TechConfig::load_from_disk(&path);
     assert!(!written);
     assert_eq!(cfg.prompt.extract_system, "自定义抽取");
+    assert_eq!(cfg.prompt.extract_tags_system, "我的分类");
     assert_eq!(cfg.llm.timeout_secs, 9);
     assert_eq!(fs::read_to_string(&path).unwrap(), text, "file byte-identical after load");
+}
+
+/// A legacy `[prompt]` that predates `extract_tags_system` (the auto-tag field)
+/// is healed in place: just that field is patched with the factory default, the
+/// user's other templates survive verbatim, and the returned config carries the
+/// patched value. A *present-but-empty* field is NOT healed (deliberate "auto-tag
+/// off").
+#[test]
+fn load_from_disk_heals_missing_extract_tags_field() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("felin.toml");
+    // Legacy 3-field [prompt]: no extract_tags_system key at all.
+    let legacy = "# 注释\n[prompt]\nextract_system = \"我的抽取\"\ntranslation_system = \"我的 system\"\ntranslation_user = \"我的 user\"\n[llm]\ntimeout_secs = 7\n";
+    fs::write(&path, legacy).unwrap();
+
+    let (cfg, written) = TechConfig::load_from_disk(&path);
+    assert!(written, "a missing extract_tags_system key must be healed");
+    // User templates survive; the auto-tag field is filled from the factory.
+    assert_eq!(cfg.prompt.extract_system, "我的抽取");
+    assert_eq!(cfg.prompt.translation_system, "我的 system");
+    assert_eq!(cfg.prompt.translation_user, "我的 user");
+    assert!(!cfg.prompt.extract_tags_system.is_empty());
+    assert!(cfg.prompt.extract_tags_system.contains("分类"));
+    assert_eq!(cfg.llm.timeout_secs, 7);
+    // Second load: key present → no rewrite.
+    let (_, written2) = TechConfig::load_from_disk(&path);
+    assert!(!written2);
+
+    // A present-but-empty value is a deliberate "auto-tag off" — never healed.
+    let dir2 = TempDir::new().unwrap();
+    let path2 = dir2.path().join("felin.toml");
+    let empty = "[prompt]\nextract_system = \"抽取\"\nextract_tags_system = \"\"\n";
+    fs::write(&path2, empty).unwrap();
+    let (cfg2, written2) = TechConfig::load_from_disk(&path2);
+    assert!(!written2, "explicit empty field must be left alone");
+    assert!(cfg2.prompt.extract_tags_system.is_empty());
 }
 
 /// An invalid felin.toml falls back to defaults (empty prompts) without

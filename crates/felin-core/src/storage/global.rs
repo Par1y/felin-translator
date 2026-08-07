@@ -184,6 +184,19 @@ impl GlobalDb {
         })
     }
 
+    /// Set a global entry's category. The caller decides whether to overwrite
+    /// (the confirm path only fills it when the entry has none, so an
+    /// established category from another project survives).
+    pub fn set_name_category(&self, id: i64, category: &str) -> Result<()> {
+        self.db.write(|c| {
+            c.execute(
+                "UPDATE names SET category = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![category, now_iso8601(), id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// All canonical japanese forms paired with their name id, for building a
     /// [`crate::names::Matcher`].
     pub fn glossary_forms(&self) -> Result<Vec<(String, i64)>> {

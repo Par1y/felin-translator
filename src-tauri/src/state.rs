@@ -1,6 +1,7 @@
 //! Application state shared across Tauri commands.
 
 use felin_core::config::PromptConfig;
+use felin_core::llm::Semaphore;
 use felin_core::storage::{GlobalDb, ProjectDb, ProjectLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,11 +63,21 @@ pub struct AppState {
     pub tasks: Mutex<HashMap<String, watch::Sender<bool>>>,
     /// The active translation run, if any.
     pub translation: Mutex<Option<TranslationRun>>,
+    /// App-wide LLM rate limiter: every `LlmClient::with_limiter` shares this
+    /// `Arc`, so translation workers, name extraction, auto-tag and connection
+    /// tests all queue on one global concurrency cap (see
+    /// `docs/data-contract.md` §6).
+    pub llm_limiter: Arc<Semaphore>,
 }
 
 impl AppState {
     pub fn projects_dir(&self) -> PathBuf {
         self.data_dir.join("projects")
+    }
+
+    /// Build the app-wide LLM rate limiter sized by `felin.toml [llm] concurrency`.
+    pub fn llm_limiter(concurrency: u64) -> Arc<Semaphore> {
+        Arc::new(Semaphore::new((concurrency.clamp(1, 16)) as usize))
     }
 
     /// Lock `project`, recovering from poisoning so one panicked command can't

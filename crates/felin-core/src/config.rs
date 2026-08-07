@@ -198,6 +198,12 @@ pub struct LlmDefaults {
     pub max_delay_secs: u64,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// **Global** cap on simultaneous LLM calls across ALL features (translation
+    /// workers, name extraction, auto-tag, connection test). 1–16. The unified
+    /// concurrency model (see `docs/data-contract.md` §6) funnels every LLM call
+    /// through one shared semaphore sized by this, so an extraction pass can't
+    /// pile on top of a running translation.
+    pub concurrency: u64,
 }
 
 impl Default for LlmDefaults {
@@ -209,6 +215,7 @@ impl Default for LlmDefaults {
             max_delay_secs: 30,
             temperature: None,
             max_tokens: None,
+            concurrency: 2,
         }
     }
 }
@@ -318,6 +325,8 @@ base_delay_ms = 500
 max_delay_secs = 30
 # temperature = 0.3     # 可选，覆盖模型默认
 # max_tokens = 2048     # 可选
+# concurrency = 2       # 全局 LLM 并发上限（1–16）：翻译 worker、专名抽取、
+#                       # 自动打标签、连接测试共用此限流，避免同时打爆上游。
 
 [sidecar]
 cancel_grace_secs = 8
@@ -390,6 +399,23 @@ enabled = false
                                 false
                             }
                         }
+                    } else if !prompt_section_has_key(&s, "extract_tags_system") {
+                        // `[prompt]` exists but predates the `extract_tags_system`
+                        // field entirely (a legacy install whose section was
+                        // written before auto-tag existed): patch in just that
+                        // field with the factory default so auto-tag works out of
+                        // the box. Only *absent* fields are healed — an explicitly
+                        // present-but-empty value (`extract_tags_system = ""`) is
+                        // a deliberate "auto-tag off" and is never touched.
+                        let mut patched = c.prompt.clone();
+                        patched.extract_tags_system = factory_prompt_config().extract_tags_system;
+                        match set_prompt_section(path, &patched) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "could not heal extract_tags_system in felin.toml");
+                                false
+                            }
+                        }
                     } else {
                         false
                     };
@@ -429,6 +455,29 @@ enabled = false
 /// column-0 table header is unambiguous here).
 fn has_prompt_section(text: &str) -> bool {
     text.lines().any(|l| l.trim_start() == "[prompt]")
+}
+
+/// Does the `[prompt]` section contain a `key = …` line? Scoped to the section
+/// (from its header to the next `[` table header) so a mention of the key in a
+/// comment or another section can't suppress healing. Matches `key` followed by
+/// optional spaces then `=` (toml's `key = value`), mirroring what `toml` serde
+/// writes.
+fn prompt_section_has_key(text: &str, key: &str) -> bool {
+    let mut in_prompt = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            in_prompt = t == "[prompt]";
+            continue;
+        }
+        if in_prompt && t.starts_with(key) {
+            let after = &t[key.len()..];
+            if after.trim_start().starts_with('=') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Append a `[prompt]` section carrying the factory prompt templates to `path`

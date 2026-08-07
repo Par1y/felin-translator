@@ -37,7 +37,6 @@ export default function NamesPage() {
     japanese: "",
     chinese: "",
     english: "",
-    category: "",
     tags: [] as string[],
     notes: "",
   });
@@ -84,14 +83,13 @@ export default function NamesPage() {
   const openEdit = (e?: GlossaryEntry) => {
     if (!e) {
       setEditId(null);
-      setEditForm({ japanese: "", chinese: "", english: "", category: "", tags: [], notes: "" });
+      setEditForm({ japanese: "", chinese: "", english: "", tags: [], notes: "" });
     } else {
       setEditId(e.id);
       setEditForm({
         japanese: e.japanese,
         chinese: e.chinese ?? "",
         english: e.english ?? "",
-        category: e.category ?? "",
         tags: e.tags,
         notes: e.notes ?? "",
       });
@@ -104,11 +102,12 @@ export default function NamesPage() {
       message.warning("日文不能为空");
       return;
     }
+    // 类别 = 第一个标签（与自动打标签/确认进词库的约定一致），不再单独输入。
     const input = {
       japanese: editForm.japanese.trim(),
       chinese: editForm.chinese.trim() || null,
       english: editForm.english.trim() || null,
-      category: editForm.category.trim() || null,
+      category: editForm.tags[0]?.trim() || null,
       tags: editForm.tags,
       notes: editForm.notes.trim() || null,
     };
@@ -401,10 +400,9 @@ export default function NamesPage() {
           <Input addonBefore="日文" value={editForm.japanese} onChange={(e) => setEditForm({ ...editForm, japanese: e.target.value })} />
           <Input addonBefore="中文" value={editForm.chinese} onChange={(e) => setEditForm({ ...editForm, chinese: e.target.value })} />
           <Input addonBefore="英文" value={editForm.english} onChange={(e) => setEditForm({ ...editForm, english: e.target.value })} />
-          <Input addonBefore="类别" value={editForm.category} onChange={(e) => setEditForm({ ...editForm, category: e.target.value })} />
           <Select
             mode="tags"
-            placeholder="标签（回车添加）"
+            placeholder="标签（回车添加；第一个标签作为类别，如：人名）"
             value={editForm.tags}
             onChange={(v: string[]) => setEditForm({ ...editForm, tags: v })}
             style={{ width: "100%" }}

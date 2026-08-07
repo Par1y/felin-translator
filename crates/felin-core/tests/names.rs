@@ -235,6 +235,7 @@ async fn classify_names_maps_forms_and_normalizes() {
         max_delay: Duration::from_millis(5),
         temperature: None,
         max_tokens: None,
+        concurrency: 2,
     })
     .unwrap();
 
@@ -261,6 +262,7 @@ async fn classify_names_refuses_empty_prompt() {
         max_delay: Duration::from_millis(5),
         temperature: None,
         max_tokens: None,
+        concurrency: 2,
     })
     .unwrap();
     let tags = felin_core::names::classify_names(&client, &["田中".into()], "  ").await;

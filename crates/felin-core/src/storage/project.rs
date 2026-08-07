@@ -878,6 +878,40 @@ impl ProjectDb {
         })
     }
 
+    /// Edit a candidate's japanese form (OCR may misread, so the user can
+    /// correct it like the Chinese). The form is NFKC-normalized before storing
+    /// (matching every other writer), so the stored value stays comparable to
+    /// extraction-inserted rows and the auto-tag `by_form` map. Refuses when
+    /// another candidate already holds the same normalized form (the column is
+    /// the dedup key), so a rename can't silently collapse two rows.
+    pub fn update_extracted_japanese(&self, id: i64, japanese: &str) -> Result<()> {
+        let jp = crate::names::normalize(japanese.trim());
+        if jp.is_empty() {
+            return Err(Error::InvalidInput { detail: "japanese 不能为空".into() });
+        }
+        let existing: Option<i64> = self.db.read(|c| {
+            c.query_row(
+                "SELECT id FROM extracted_names WHERE japanese = ?1 AND id != ?2",
+                rusqlite::params![jp, id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })?;
+        if existing.is_some() {
+            return Err(Error::InvalidInput {
+                detail: format!("已有同名的专名候选：{jp}"),
+            });
+        }
+        self.db.write(|c| {
+            c.execute(
+                "UPDATE extracted_names SET japanese = ?1 WHERE id = ?2",
+                rusqlite::params![jp, id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Replace a candidate's category tags (JSON array).
     pub fn set_extracted_tags(&self, id: i64, tags: &[String]) -> Result<()> {
         self.db.write(|c| {

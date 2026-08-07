@@ -3,12 +3,19 @@
 use crate::error::{Error, Result};
 use crate::llm::{ChatMessage, LlmConfig, TranslateRequest};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// A configured LLM client.
 pub struct LlmClient {
     config: LlmConfig,
     http: reqwest::Client,
+    /// Global concurrency limiter shared across every LLM feature (translation
+    /// workers, extraction, auto-tag, connection test). `Arc` so several
+    /// clients — one per run — share the same cap instead of each getting its
+    /// own. See `docs/data-contract.md` §6.
+    limiter: Arc<Semaphore>,
 }
 
 /// Internal per-attempt failure classification.
@@ -49,13 +56,22 @@ fn chat_url(endpoint: &str) -> String {
 }
 
 impl LlmClient {
-    /// Build a client from `config`.
+    /// Build a client from `config`, with its own private concurrency limiter
+    /// sized by `config.concurrency` (tests / one-off callers).
     pub fn new(config: LlmConfig) -> Result<Self> {
+        let permits = (config.concurrency.clamp(1, 16)) as usize;
+        Self::with_limiter(config, Arc::new(Semaphore::new(permits)))
+    }
+
+    /// Build a client that shares `limiter` (the app-wide one) instead of
+    /// creating its own — the unified-concurrency path: every feature's client
+    /// is constructed here so all LLM calls queue on one global cap.
+    pub fn with_limiter(config: LlmConfig, limiter: Arc<Semaphore>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
             .build()
             .map_err(|e| Error::llm(format!("failed to build HTTP client: {e}")))?;
-        Ok(Self { config, http })
+        Ok(Self { config, http, limiter })
     }
 
     pub fn config(&self) -> &LlmConfig {
@@ -68,7 +84,11 @@ impl LlmClient {
         self.chat(&crate::llm::build_messages(req)).await
     }
 
-    /// One chat completion, with retry/backoff on transient failures.
+    /// One chat completion, with retry/backoff on transient failures. A permit
+    /// is acquired **per network attempt** and released before the backoff
+    /// sleep, so the shared cap bounds in-flight requests without letting one
+    /// stalled call hog a permit (and thus block every other LLM feature) for
+    /// the whole retry window.
     pub async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         let url = chat_url(&self.config.endpoint);
         let mut body = serde_json::json!({
@@ -85,7 +105,19 @@ impl LlmClient {
 
         let mut attempt = 0u32;
         loop {
-            match self.try_once(&url, &body).await {
+            // Scope the permit to a single network attempt: it is released
+            // before the backoff sleep below, so a stalled call never holds a
+            // permit (and thus never blocks every other LLM feature) across the
+            // whole retry window.
+            let outcome = {
+                let _permit = self
+                    .limiter
+                    .acquire()
+                    .await
+                    .map_err(|e| Error::llm(format!("rate limiter closed: {e}")))?;
+                self.try_once(&url, &body).await
+            };
+            match outcome {
                 Ok(text) => return Ok(text),
                 Err(CallError::Fatal(msg)) => return Err(Error::llm(msg)),
                 Err(CallError::Retryable { msg, retry_after }) => {

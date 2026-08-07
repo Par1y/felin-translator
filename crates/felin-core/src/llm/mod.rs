@@ -12,6 +12,9 @@ pub mod prompt;
 pub use client::LlmClient;
 pub use json::extract_json;
 pub use prompt::{build_messages, TranslateRequest};
+/// Re-exported so `AppState` can build one app-wide rate limiter and pass it to
+/// every `LlmClient::with_limiter` (the unified-concurrency model).
+pub use tokio::sync::Semaphore;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -64,6 +67,10 @@ pub struct LlmConfig {
     pub max_delay: Duration,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// Global cap on simultaneous LLM calls across ALL features (see
+    /// `docs/data-contract.md` §6). Used only when the client owns its own
+    /// semaphore; shared-limb clients share the app-wide one.
+    pub concurrency: u64,
 }
 
 impl Default for LlmConfig {
@@ -78,6 +85,7 @@ impl Default for LlmConfig {
             max_delay: Duration::from_secs(30),
             temperature: None,
             max_tokens: None,
+            concurrency: 2,
         }
     }
 }

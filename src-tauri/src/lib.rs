@@ -26,6 +26,7 @@ pub fn run() {
     init_tracing(debug_enabled);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(build_state()?);
             Ok(())
@@ -63,6 +64,7 @@ pub fn run() {
             commands::run_name_extraction,
             commands::list_extracted,
             commands::update_extracted,
+            commands::update_extracted_japanese,
             commands::update_extracted_tags,
             commands::auto_tag_extracted,
             commands::apply_extracted_tags,
@@ -162,6 +164,7 @@ fn build_state() -> Result<AppState, Box<dyn std::error::Error>> {
     // Seed the runtime-effective prompt templates from the loaded config;
     // `set_prompt_config` swaps this in place (no restart needed).
     let prompt = config.prompt.clone();
+    let llm_limiter = AppState::llm_limiter(config.llm.concurrency);
 
     Ok(AppState {
         data_dir,
@@ -173,6 +176,7 @@ fn build_state() -> Result<AppState, Box<dyn std::error::Error>> {
         project: Mutex::new(None),
         tasks: Mutex::new(HashMap::new()),
         translation: Mutex::new(None),
+        llm_limiter,
     })
 }
 

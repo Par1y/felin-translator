@@ -80,6 +80,8 @@ export const api = {
   runNameExtraction: () => invoke<number>("run_name_extraction"),
   listExtracted: (status?: string) => invoke<ExtractedName[]>("list_extracted", { status: status ?? null }),
   updateExtracted: (id: number, chinese: string) => invoke<void>("update_extracted", { id, chinese }),
+  updateExtractedJapanese: (id: number, japanese: string) =>
+    invoke<void>("update_extracted_japanese", { id, japanese }),
   updateExtractedTags: (id: number, tags: string[]) =>
     invoke<void>("update_extracted_tags", { id, tags }),
   autoTagExtracted: (ids: number[]) => invoke<number>("auto_tag_extracted", { ids }),

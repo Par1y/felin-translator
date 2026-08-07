@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { App as AntdApp, Button, Card, Empty, Input, List, Modal, Popconfirm, Space, Tag, Typography } from "antd";
 import type { ProjectSummary } from "../types";
 import { api } from "../api";
+import { pickFile } from "../dialog";
 
 export default function ProjectsPage({
   project,
@@ -207,6 +208,17 @@ export default function ProjectsPage({
             onChange={(e) => setImportPath(e.target.value)}
             onPressEnter={importArchive}
           />
+          <Button
+            onClick={async () => {
+              const p = await pickFile({
+                title: "选择项目归档",
+                filters: [{ name: "项目归档", extensions: ["zip"] }],
+              });
+              if (p) setImportPath(p);
+            }}
+          >
+            选择…
+          </Button>
           <Button loading={importing} onClick={importArchive}>
             导入归档
           </Button>

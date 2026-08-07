@@ -28,6 +28,7 @@ import type {
 } from "../types";
 import { DEFAULT_IMAGE_RULE } from "../types";
 import { api, onOcrDone, onOcrError, onOcrProgress } from "../api";
+import { pickDirectory, pickFile } from "../dialog";
 
 /// Confirmation target for extracted candidates / CSV rows.
 type GlossaryTarget = "project" | "global";
@@ -492,7 +493,36 @@ export default function ImportPage() {
   };
 
   const candidateColumns: TableProps<ExtractedName>["columns"] = [
-    { title: "日文", dataIndex: "japanese", width: 220 },
+    {
+      title: "日文（可改）",
+      dataIndex: "japanese",
+      width: 220,
+      render: (v: string, r) => (
+        <Input
+          size="small"
+          defaultValue={v}
+          onBlur={(e) => {
+            const val = e.target.value.trim();
+            if (val !== v) {
+              api
+                .updateExtractedJapanese(r.id, val)
+                .then(() => {
+                  message.success("日文已修正");
+                  // Refresh so the row's stored value matches (also clears any
+                  // stale rendered form from a failed rename).
+                  void loadCandidates();
+                })
+                .catch((err) => {
+                  message.error(String(err));
+                  // Reset the input to the stored value so the cell never shows
+                  // a japanese the DB doesn't have.
+                  e.target.value = v;
+                });
+            }
+          }}
+        />
+      ),
+    },
     {
       title: "中文（可改）",
       dataIndex: "candidate_chinese",
@@ -567,6 +597,17 @@ export default function ImportPage() {
             onChange={(e) => setTxtPath(e.target.value)}
             onPressEnter={importTxt}
           />
+          <Button
+            onClick={async () => {
+              const p = await pickFile({
+                title: "选择文本文件",
+                filters: [{ name: "文本", extensions: ["txt", "md"] }],
+              });
+              if (p) setTxtPath(p);
+            }}
+          >
+            选择…
+          </Button>
           <Button onClick={importTxt}>导入文本</Button>
         </Space.Compact>
         <Typography.Paragraph
@@ -590,12 +631,28 @@ export default function ImportPage() {
           />
           {ocrMode === "pdf" ? (
             <Space direction="vertical" style={{ width: "100%" }}>
-              <Input
-                addonBefore="文件"
-                placeholder="/path/to/book.pdf"
-                value={pdfPath}
-                onChange={(e) => setPdfPath(e.target.value)}
-              />
+              <Space.Compact style={{ width: "100%" }}>
+                <Input
+                  addonBefore="文件"
+                  placeholder="/path/to/book.pdf"
+                  value={pdfPath}
+                  onChange={(e) => setPdfPath(e.target.value)}
+                />
+                <Button
+                  onClick={async () => {
+                    const p = await pickFile({
+                      title: "选择 PDF / 图片文件",
+                      filters: [
+                        { name: "文档", extensions: ["pdf"] },
+                        { name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] },
+                      ],
+                    });
+                    if (p) setPdfPath(p);
+                  }}
+                >
+                  选择…
+                </Button>
+              </Space.Compact>
               <Input
                 addonBefore="页码"
                 placeholder="可选，如 3,7,10-12（留空 = 全部）"
@@ -610,12 +667,22 @@ export default function ImportPage() {
             </Space>
           ) : (
             <Space direction="vertical" style={{ width: "100%" }}>
-              <Input
-                addonBefore="目录"
-                placeholder="/path/to/pages"
-                value={imgDir}
-                onChange={(e) => setImgDir(e.target.value)}
-              />
+              <Space.Compact style={{ width: "100%" }}>
+                <Input
+                  addonBefore="目录"
+                  placeholder="/path/to/pages"
+                  value={imgDir}
+                  onChange={(e) => setImgDir(e.target.value)}
+                />
+                <Button
+                  onClick={async () => {
+                    const p = await pickDirectory({ title: "选择图片目录" });
+                    if (p) setImgDir(p);
+                  }}
+                >
+                  选择…
+                </Button>
+              </Space.Compact>
               <Space wrap>
                 <Select
                   style={{ width: 200 }}
@@ -862,6 +929,17 @@ export default function ImportPage() {
               onChange={(e) => setCsvPath(e.target.value)}
               onPressEnter={importCsv}
             />
+            <Button
+              onClick={async () => {
+                const p = await pickFile({
+                  title: "选择词库 CSV",
+                  filters: [{ name: "CSV", extensions: ["csv"] }],
+                });
+                if (p) setCsvPath(p);
+              }}
+            >
+              选择…
+            </Button>
             <Button onClick={previewCsv}>预览表头</Button>
             <Button type="primary" onClick={importCsv}>
               导入

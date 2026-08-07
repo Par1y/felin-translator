@@ -430,9 +430,10 @@ pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<S
     };
     drop(prompt);
     // Build the translator now so config errors reject the invoke synchronously
-    // (before any task_id / events exist).
+    // (before any task_id / events exist). The client shares the app-wide rate
+    // limiter, so this run's workers queue with every other LLM feature.
     let translator = Arc::new(LlmTranslator {
-        client: LlmClient::new(llm_cfg).map_err(|e| e.to_string())?,
+        client: LlmClient::with_limiter(llm_cfg, Arc::clone(&state.llm_limiter)).map_err(|e| e.to_string())?,
     });
 
     let task_id = uuid::Uuid::new_v4().to_string();
@@ -465,6 +466,11 @@ pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<S
         }
         let _dereg = Dereg { app: app_thread.clone(), tid: tid.clone() };
 
+        // The pipeline workers call blocking rusqlite (DB claim/save) inside
+        // async tasks, so a multi-threaded runtime is required: a blocking call
+        // only stalls one of its OS threads, whereas current_thread would freeze
+        // every worker and the sidecar streaming. 2 worker threads is plenty —
+        // the N pipeline workers are tokio tasks interleaving on them.
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -953,7 +959,7 @@ pub async fn test_llm_connection(state: State<'_, AppState>) -> Result<(), Strin
         let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
         load_llm_config(&proj.db, &state.config.llm)?
     };
-    let client = LlmClient::new(cfg).map_err(|e| e.to_string())?;
+    let client = LlmClient::with_limiter(cfg, Arc::clone(&state.llm_limiter)).map_err(|e| e.to_string())?;
     let req = TranslateRequest {
         guidelines: "你是连接测试助手。请只回复两个字：通过。".into(),
         source: "连接测试".into(),
@@ -1587,6 +1593,7 @@ fn load_llm_config(
         max_delay: std::time::Duration::from_secs(defaults.max_delay_secs),
         temperature: defaults.temperature,
         max_tokens: defaults.max_tokens,
+        concurrency: defaults.concurrency,
         ..felin_core::llm::LlmConfig::default()
     };
     if let Some(e) = db.get_setting("llm_endpoint").map_err(|e| e.to_string())?.filter(|s| !s.is_empty()) {
@@ -1749,7 +1756,11 @@ pub async fn run_name_extraction(state: State<'_, AppState>) -> Result<usize, St
     let (client, chapters, extract_system) = {
         let guard = state.project_guard();
         let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
-        let client = LlmClient::new(load_llm_config(&proj.db, &state.config.llm)?).map_err(|e| e.to_string())?;
+        let client = LlmClient::with_limiter(
+            load_llm_config(&proj.db, &state.config.llm)?,
+            Arc::clone(&state.llm_limiter),
+        )
+        .map_err(|e| e.to_string())?;
         let extract_system = state.prompt_config().extract_system.clone();
         let mut chapters = Vec::new();
         for ch in proj.db.list_chapters().map_err(|e| e.to_string())? {
@@ -1812,6 +1823,17 @@ pub fn update_extracted(state: State<'_, AppState>, id: i64, chinese: String) ->
     with_project(&state, |p| p.db.update_extracted_chinese(id, &chinese))
 }
 
+/// Edit a candidate's japanese form (OCR may misread, so it's user-editable
+/// like the Chinese). Rejects renames that collide with another candidate.
+#[tauri::command]
+pub fn update_extracted_japanese(
+    state: State<'_, AppState>,
+    id: i64,
+    japanese: String,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.update_extracted_japanese(id, &japanese))
+}
+
 /// Replace one candidate's category tags (JSON array). User-edited tags are
 /// honored verbatim; nothing downstream re-derives them.
 #[tauri::command]
@@ -1837,7 +1859,11 @@ pub async fn auto_tag_extracted(state: State<'_, AppState>, ids: Vec<i64>) -> Re
     let (client, forms) = {
         let guard = state.project_guard();
         let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
-        let client = LlmClient::new(load_llm_config(&proj.db, &state.config.llm)?).map_err(|e| e.to_string())?;
+        let client = LlmClient::with_limiter(
+            load_llm_config(&proj.db, &state.config.llm)?,
+            Arc::clone(&state.llm_limiter),
+        )
+        .map_err(|e| e.to_string())?;
         let mut seen = std::collections::HashSet::new();
         let mut forms: Vec<String> = Vec::new();
         for id in ids {

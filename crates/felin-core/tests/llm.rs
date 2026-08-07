@@ -33,6 +33,7 @@ fn cfg(uri: String) -> LlmConfig {
         max_delay: Duration::from_millis(5),
         temperature: None,
         max_tokens: None,
+        concurrency: 2,
     }
 }
 
@@ -262,4 +263,55 @@ fn handles_object() {
         felin_core::llm::extract_json("note {\"k\": true} end").unwrap(),
         serde_json::json!({"k": true})
     );
+}
+
+// ----- unified concurrency limiter -------------------------------------------
+
+#[tokio::test]
+async fn shared_limiter_caps_concurrent_llm_calls() {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    // A server that delays each response so concurrent calls would overlap if
+    // the semaphore didn't cap them.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(120))
+                .set_body_json(ok_body("ok")),
+        )
+        .mount(&server)
+        .await;
+
+    // Two clients sharing one limiter of capacity 1.
+    let limiter = Arc::new(Semaphore::new(1));
+    let a = LlmClient::with_limiter(cfg(server.uri()), Arc::clone(&limiter)).unwrap();
+    let b = LlmClient::with_limiter(cfg(server.uri()), limiter).unwrap();
+
+    // Fire both concurrently. With a shared cap of 1 they serialize, so the
+    // total wall time ≈ 2 × delay; without sharing they'd overlap ≈ 1 × delay.
+    let msg = [ChatMessage::user("hi")];
+    let start = std::time::Instant::now();
+    let (r1, r2) = tokio::join!(a.chat(&msg), b.chat(&msg));
+    let elapsed = start.elapsed();
+    assert_eq!(r1.unwrap(), "ok");
+    assert_eq!(r2.unwrap(), "ok");
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "shared cap 1 must serialize two calls (elapsed {elapsed:?})"
+    );
+
+    // And each client's own limit would also apply if not shared.
+    let solo = LlmClient::new(LlmConfig {
+        concurrency: 1,
+        ..cfg(server.uri())
+    })
+    .unwrap();
+    let start = std::time::Instant::now();
+    let (r1, r2) = tokio::join!(solo.chat(&msg), solo.chat(&msg));
+    assert!(start.elapsed() >= Duration::from_millis(200));
+    assert_eq!(r1.unwrap(), "ok");
+    assert_eq!(r2.unwrap(), "ok");
 }

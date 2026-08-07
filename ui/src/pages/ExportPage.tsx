@@ -2,6 +2,7 @@ import { useState } from "react";
 import { App as AntdApp, Alert, Button, Card, Input, Space, Typography } from "antd";
 import type { ExportResult, TranslationExport } from "../types";
 import { api } from "../api";
+import { pickDirectory, pickSavePath } from "../dialog";
 
 export default function ExportPage() {
   const { message } = AntdApp.useApp();
@@ -51,13 +52,23 @@ export default function ExportPage() {
       {/* 译文导出：确定性 汉化 .txt + 译文.csv。 */}
       <Card title="译文导出">
         <Space direction="vertical" style={{ width: "100%" }}>
-          <Input
-            addonBefore="目标目录"
-            placeholder="/path/to/output"
-            value={txDir}
-            onChange={(e) => setTxDir(e.target.value)}
-            onPressEnter={doTxExport}
-          />
+          <Space.Compact style={{ width: "100%" }}>
+            <Input
+              addonBefore="目标目录"
+              placeholder="/path/to/output"
+              value={txDir}
+              onChange={(e) => setTxDir(e.target.value)}
+              onPressEnter={doTxExport}
+            />
+            <Button
+              onClick={async () => {
+                const p = await pickDirectory({ title: "选择译文导出目录" });
+                if (p) setTxDir(p);
+              }}
+            >
+              选择…
+            </Button>
+          </Space.Compact>
           <Button type="primary" loading={txBusy} onClick={doTxExport}>
             导出译文
           </Button>
@@ -83,13 +94,27 @@ export default function ExportPage() {
       {/* 项目归档：单个压缩包 + SHA-256，携带项目小词库。 */}
       <Card title="导出项目">
         <Space direction="vertical" style={{ width: "100%" }}>
-          <Input
-            addonBefore="目标"
-            placeholder="/path/to/my-book.zip"
-            value={dest}
-            onChange={(e) => setDest(e.target.value)}
-            onPressEnter={doExport}
-          />
+          <Space.Compact style={{ width: "100%" }}>
+            <Input
+              addonBefore="目标"
+              placeholder="/path/to/my-book.zip"
+              value={dest}
+              onChange={(e) => setDest(e.target.value)}
+              onPressEnter={doExport}
+            />
+            <Button
+              onClick={async () => {
+                const p = await pickSavePath({
+                  title: "导出项目归档",
+                  defaultPath: "my-book.felinproj.zip",
+                  filters: [{ name: "项目归档", extensions: ["zip"] }],
+                });
+                if (p) setDest(p);
+              }}
+            >
+              选择…
+            </Button>
+          </Space.Compact>
           <Button type="primary" loading={busy} onClick={doExport}>
             导出当前项目
           </Button>

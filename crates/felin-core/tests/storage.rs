@@ -273,6 +273,23 @@ fn extracted_tags_are_editable_and_survive_reopen() {
 }
 
 #[test]
+fn extracted_japanese_is_editable_with_dedup_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let a = p.insert_extracted("田中", Some("田中"), None, None).unwrap().unwrap();
+    let b = p.insert_extracted("佐藤", Some("佐藤"), None, None).unwrap().unwrap();
+
+    // Rename to a fresh form works.
+    p.update_extracted_japanese(a, "田中 太郎").unwrap();
+    assert_eq!(p.get_extracted(a).unwrap().unwrap().japanese, "田中 太郎");
+    // Renaming onto an existing candidate's form is refused (dedup key).
+    let err = p.update_extracted_japanese(b, "田中 太郎").unwrap_err();
+    assert!(err.to_string().contains("同名"), "collision must be rejected: {err}");
+    // Empty is refused too.
+    assert!(p.update_extracted_japanese(a, "   ").is_err());
+}
+
+#[test]
 fn segment_cleans_detects_chapters_and_builds_tus() {
     let dir = tempfile::tempdir().unwrap();
     let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
