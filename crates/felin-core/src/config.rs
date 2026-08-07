@@ -142,6 +142,9 @@ impl Default for ImportConfig {
 pub struct PromptConfig {
     /// Name-extraction system message (专名抽取). Empty → no system message.
     pub extract_system: String,
+    /// Name-classification system message (专名自动打标签). Empty → the
+    /// auto-tag command refuses with a config hint (找不到即报错).
+    pub extract_tags_system: String,
     /// Translation system-message template with `{guidelines}` / `{instruction}`
     /// / `{glossary}` placeholders. Empty → no system message.
     pub translation_system: String,
@@ -153,7 +156,12 @@ pub struct PromptConfig {
 impl Default for PromptConfig {
     fn default() -> Self {
         // Deliberately empty: prompt text must come from the config file.
-        Self { extract_system: String::new(), translation_system: String::new(), translation_user: String::new() }
+        Self {
+            extract_system: String::new(),
+            extract_tags_system: String::new(),
+            translation_system: String::new(),
+            translation_user: String::new(),
+        }
     }
 }
 
@@ -166,7 +174,13 @@ pub(crate) fn factory_prompt_config() -> PromptConfig {
     PromptConfig {
         extract_system: "你是日文专有名词抽取助手。从给定日文文本中抽取专有名词（人名、地名、\
 组织、作品名、独特术语等），忽略普通词汇。只输出 JSON 数组，每项形如 \
-{\"japanese\":\"原文形式\",\"guess_chinese\":\"推测中文\",\"context\":\"简短出处\"}，\
+{\"japanese\":\"原文形式\",\"guess_chinese\":\"推测中文\",\"category\":\"类别\",\
+\"context\":\"简短出处\"}，其中 category 只能是：人名、地名、组织、作品名、物品、系统、\
+术语、其他。不要输出任何其他文字。"
+            .to_string(),
+        extract_tags_system: "你是专有名词分类助手。对用户给出的每个专有名词判断其类别，\
+只输出 JSON 数组，每项形如 {\"japanese\":\"原文形式\",\"category\":\"类别\"}，\
+其中 category 只能是：人名、地名、组织、作品名、物品、系统、术语、其他。\
 不要输出任何其他文字。"
             .to_string(),
         translation_system: "{guidelines}\n\n附加要求（优先级高于总则）：\n{instruction}\n\n专名参考（词表，必须使用）：\n{glossary}".to_string(),

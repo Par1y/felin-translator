@@ -548,34 +548,86 @@ export default function SettingsPage() {
             Prompt 模板（felin.toml [prompt]，保存后立即生效）
           </Divider>
 
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 4 }}
+            message="占位符说明"
+            description={
+              <Descriptions column={1} size="small" style={{ marginTop: 4 }}>
+                <Descriptions.Item label="{guidelines}">
+                  项目翻译总则（本卡片上方编辑，存于项目数据库）
+                </Descriptions.Item>
+                <Descriptions.Item label="{instruction}">
+                  该 TU 的人工指示（校对页逐条翻译时填写，重译时带入）
+                </Descriptions.Item>
+                <Descriptions.Item label="{glossary}">
+                  该 TU 命中的小词库专名（「日文 → 中文」，翻译必须使用）
+                </Descriptions.Item>
+                <Descriptions.Item label="{context}">
+                  上一段已批准译文（仅供风格与称谓参考）
+                </Descriptions.Item>
+                <Descriptions.Item label="{source}">
+                  待翻译原文（唯一的必填内容）
+                </Descriptions.Item>
+              </Descriptions>
+            }
+          />
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 8 }}
+            message="按空行分段；整段占位符全部为空时该段不发送"
+            description="模板按空行拆成段落逐段渲染：某段引用的占位符（如 {instruction}、{glossary}、{context}）全部为空时，整段不会发给模型；不含占位符的段落原样保留。因此 `{source}` 必须出现在 User 模板中，否则译文将为空。"
+          />
+
           {promptError && (
             <Alert type="error" showIcon message="无法读取提示词配置" description={promptError} />
           )}
           {prompt && (
             <Space direction="vertical" style={{ width: "100%" }}>
-              <Text type="secondary">
-                专名抽取 Prompt（extract_system）—— 留空 = 不发送 system 消息
-              </Text>
+              <div>
+                <Text strong>专名抽取 Prompt</Text>
+                <Text type="secondary">（extract_system）—— 留空 = 不发送 system 消息，仅发送章节原文</Text>
+              </div>
               <Input.TextArea
                 value={prompt.extract_system}
                 onChange={(e) => setPrompt({ ...prompt, extract_system: e.target.value })}
                 rows={3}
                 placeholder="专名抽取 system 消息，例如“从给定日文文本中抽取专有名词…”"
               />
-              <Text type="secondary">
-                翻译 System 模板（translation_system）—— 占位符：{"{guidelines}"} /{" "}
-                {"{instruction}"} / {"{glossary}"}；留空 = 不发送 system 消息
-              </Text>
+              <div>
+                <Text strong>专名自动打标签 Prompt</Text>
+                <Text type="secondary">
+                  （extract_tags_system）—— 用于「自动打标签」，应指明可选类别（人名/地名/…）；
+                  留空时「自动打标签」按钮会拒绝执行
+                </Text>
+              </div>
+              <Input.TextArea
+                value={prompt.extract_tags_system}
+                onChange={(e) => setPrompt({ ...prompt, extract_tags_system: e.target.value })}
+                rows={3}
+                placeholder="专名分类 system 消息，例如“判断每个专有名词的类别（人名/地名/…）…”"
+              />
+              <div>
+                <Text strong>翻译 System 模板</Text>
+                <Text type="secondary">
+                  （translation_system）—— 占位符：{"{guidelines}"} / {"{instruction}"} /{" "}
+                  {"{glossary}"}；留空 = 不发送 system 消息
+                </Text>
+              </div>
               <Input.TextArea
                 value={prompt.translation_system}
                 onChange={(e) => setPrompt({ ...prompt, translation_system: e.target.value })}
                 rows={4}
                 placeholder={`{guidelines}\n\n附加要求（优先级高于总则）：{instruction}\n\n专名参考（词表，必须使用）：{glossary}`}
               />
-              <Text type="secondary">
-                翻译 User 模板（translation_user）—— 占位符：{"{context}"} / {"{source}"}；
-                留空 = 只发送原文
-              </Text>
+              <div>
+                <Text strong>翻译 User 模板</Text>
+                <Text type="secondary">
+                  （translation_user）—— 占位符：{"{context}"} / {"{source}"}；留空 = 只发送原文
+                </Text>
+              </div>
               <Input.TextArea
                 value={prompt.translation_user}
                 onChange={(e) => setPrompt({ ...prompt, translation_user: e.target.value })}

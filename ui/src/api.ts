@@ -80,6 +80,11 @@ export const api = {
   runNameExtraction: () => invoke<number>("run_name_extraction"),
   listExtracted: (status?: string) => invoke<ExtractedName[]>("list_extracted", { status: status ?? null }),
   updateExtracted: (id: number, chinese: string) => invoke<void>("update_extracted", { id, chinese }),
+  updateExtractedTags: (id: number, tags: string[]) =>
+    invoke<void>("update_extracted_tags", { id, tags }),
+  autoTagExtracted: (ids: number[]) => invoke<number>("auto_tag_extracted", { ids }),
+  applyExtractedTags: (ids: number[], tags: string[]) =>
+    invoke<number>("apply_extracted_tags", { ids, tags }),
   rejectExtracted: (id: number) => invoke<void>("reject_extracted", { id }),
   rejectExtractedBatch: (ids: number[]) => invoke<number>("reject_extracted_batch", { ids }),
   confirmExtracted: (id: number, target: "project" | "global") =>

@@ -1778,9 +1778,15 @@ pub async fn run_name_extraction(state: State<'_, AppState>) -> Result<usize, St
         }
         let zh = c.guess_chinese.trim();
         let note = c.context.trim();
+        let cat = c.proposed_category();
         let inserted = proj
             .db
-            .insert_extracted(&jp, (!zh.is_empty()).then_some(zh), (!note.is_empty()).then_some(note))
+            .insert_extracted(
+                &jp,
+                (!zh.is_empty()).then_some(zh),
+                (!cat.is_empty()).then_some(cat.as_str()),
+                (!note.is_empty()).then_some(note),
+            )
             .map_err(|e| e.to_string())?;
         if inserted.is_some() {
             added += 1;
@@ -1804,6 +1810,97 @@ pub fn list_extracted(
 #[tauri::command]
 pub fn update_extracted(state: State<'_, AppState>, id: i64, chinese: String) -> Result<(), String> {
     with_project(&state, |p| p.db.update_extracted_chinese(id, &chinese))
+}
+
+/// Replace one candidate's category tags (JSON array). User-edited tags are
+/// honored verbatim; nothing downstream re-derives them.
+#[tauri::command]
+pub fn update_extracted_tags(
+    state: State<'_, AppState>,
+    id: i64,
+    tags: Vec<String>,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.set_extracted_tags(id, &tags))
+}
+
+/// Run the LLM classification pass over the given candidate ids, writing each
+/// returned category into the candidate's tags (first tag wins; empty
+/// categories skipped). Candidates are fetched under the project lock, then the
+/// network call runs without it. `state.prompt.extract_tags_system` is the
+/// classification prompt from `felin.toml [prompt]`; when it is empty the
+/// command refuses with a hint (找不到即报错 — no silent no-op). Returns how many
+/// candidates got a category.
+#[tauri::command]
+pub async fn auto_tag_extracted(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    // Dedup, then fetch the japanese forms + LLM client under the lock; the
+    // network call runs after the lock is released.
+    let (client, forms) = {
+        let guard = state.project_guard();
+        let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
+        let client = LlmClient::new(load_llm_config(&proj.db, &state.config.llm)?).map_err(|e| e.to_string())?;
+        let mut seen = std::collections::HashSet::new();
+        let mut forms: Vec<String> = Vec::new();
+        for id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(c) = proj.db.get_extracted(id).map_err(|e| e.to_string())? {
+                forms.push(c.japanese);
+            }
+        }
+        (client, forms)
+    };
+    let classify_system = state.prompt_config().extract_tags_system.clone();
+    let suggestions = names::classify_names(&client, &forms, &classify_system).await;
+    if suggestions.is_empty() {
+        return Ok(0);
+    }
+    let mut applied = 0;
+    let guard = state.project_guard();
+    let proj = guard.as_ref().ok_or_else(|| "project was closed during auto-tag".to_string())?;
+    // The candidates the classification pass may have matched, indexed by
+    // normalized japanese form (classification returns normalized forms).
+    let by_form: std::collections::HashMap<String, ExtractedName> = proj
+        .db
+        .list_extracted_names(None)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|c| (c.japanese.clone(), c))
+        .collect();
+    for s in &suggestions {
+        let cat = s.category.trim().to_string();
+        if cat.is_empty() {
+            continue;
+        }
+        let Some(c) = by_form.get(&s.japanese) else { continue };
+        // First tag wins (existing user/LLM tags are preserved).
+        if !c.tags.is_empty() {
+            continue;
+        }
+        proj.db.set_extracted_tags(c.id, &[cat]).map_err(|e| e.to_string())?;
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// Batch-set the same category tags on many candidates — the checkbox-driven
+/// 「批量标记」 action on the extraction card (also used for 全选 + 批量确认,
+/// where the whole selection should share the chosen tag). Returns how many
+/// candidates were updated.
+#[tauri::command]
+pub fn apply_extracted_tags(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+    tags: Vec<String>,
+) -> Result<usize, String> {
+    let mut n = 0;
+    with_project(&state, |p| {
+        for id in ids {
+            p.db.set_extracted_tags(id, &tags)?;
+            n += 1;
+        }
+        Ok(n)
+    })
 }
 
 #[tauri::command]
@@ -1850,6 +1947,14 @@ fn confirm_extracted_one(
         .get_extracted(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "candidate not found".to_string())?;
+    // The candidate's own category tags (LLM-proposed or user-edited) are the
+    // canonical value. For the global pool, only fill the category when the
+    // existing entry has none — an established global category (from another
+    // project) must not be clobbered by one candidate's tag; the tags array
+    // keeps both. The small glossary is project-local and self-contained, so it
+    // takes the candidate's category directly.
+    let cand_tags = cand.tags;
+    let cand_category = cand_tags.first().cloned();
     let source = format!("project:{}", proj.slug);
     let name_id = state
         .global
@@ -1857,13 +1962,14 @@ fn confirm_extracted_one(
             &cand.japanese,
             cand.candidate_chinese.as_deref(),
             None,
-            None,
+            None, // category decided below (preserve established global category)
             None,
             &source,
             NameStatus::Draft,
         )
         .map_err(|e| e.to_string())?;
-    // Carry the existing global tags forward and stamp the source project.
+    // Carry the existing global tags forward, stamp the source project, and add
+    // any candidate categories not already present.
     let mut tags: Vec<String> = state
         .global
         .get_name(name_id)
@@ -1873,7 +1979,25 @@ fn confirm_extracted_one(
     if !tags.contains(&source) {
         tags.push(source.clone());
     }
+    for t in &cand_tags {
+        if !tags.contains(t) {
+            tags.push(t.clone());
+        }
+    }
     state.global.set_name_tags(name_id, &tags).map_err(|e| e.to_string())?;
+    // The global category is filled only when the entry has none — an
+    // established category from another project is preserved (the tags array
+    // already carries both). The small glossary is project-local, so it takes
+    // the candidate's category directly.
+    let existing_category = state
+        .global
+        .get_name(name_id)
+        .map_err(|e| e.to_string())?
+        .and_then(|g| g.category)
+        .filter(|c| !c.trim().is_empty());
+    if let (Some(cat), None) = (&cand_category, existing_category) {
+        state.global.set_name_category(name_id, cat).map_err(|e| e.to_string())?;
+    }
     if to_project {
         proj.db
             .insert_glossary_entry(
@@ -1881,7 +2005,7 @@ fn confirm_extracted_one(
                 &cand.japanese,
                 cand.candidate_chinese.as_deref(),
                 None,
-                None,
+                cand_category.as_deref(),
                 &tags,
                 None,
             )

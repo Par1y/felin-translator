@@ -13,7 +13,7 @@ pub mod matcher;
 pub mod normalize;
 
 pub use csv::{ColumnMapping, NameRow};
-pub use extract::{extract_names, parse_candidates, Candidate};
+pub use extract::{classify_names, extract_names, parse_candidates, Candidate, TagSuggestion};
 pub use fuzzy::{levenshtein, within_distance};
 pub use matcher::{Hit, Matcher};
 pub use normalize::normalize;

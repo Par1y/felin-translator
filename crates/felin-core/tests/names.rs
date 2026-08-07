@@ -173,4 +173,96 @@ fn candidate_is_deserializable_with_defaults() {
     assert_eq!(c.japanese, "猫");
     assert_eq!(c.guess_chinese, "猫");
     assert_eq!(c.context, "");
+    assert_eq!(c.proposed_category(), "");
+}
+
+#[test]
+fn candidate_category_parses_from_category_and_tags() {
+    // Explicit `category` wins; a `tags` array is accepted as a fallback.
+    let c: felin_core::names::extract::Candidate =
+        serde_json::from_value(serde_json::json!({"japanese":"田中","category":"人名"})).unwrap();
+    assert_eq!(c.proposed_category(), "人名");
+    let c: felin_core::names::extract::Candidate =
+        serde_json::from_value(serde_json::json!({"japanese":"田中","guess_tags":["地名"]})).unwrap();
+    assert_eq!(c.proposed_category(), "地名");
+    let c: felin_core::names::extract::Candidate =
+        serde_json::from_value(serde_json::json!({"japanese":"田中","guess_tags":[]})).unwrap();
+    assert_eq!(c.proposed_category(), "");
+}
+
+#[test]
+fn tag_suggestion_deserializes_tolerantly() {
+    let list: Vec<felin_core::names::extract::TagSuggestion> = serde_json::from_value(
+        serde_json::json!([{"japanese":"東京","category":"地名"},{"japanese":"猫"}]),
+    )
+    .unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].category, "地名");
+    // Missing category defaults to empty (filtered by the classifier).
+    assert_eq!(list[1].category, "");
+}
+
+// ----- names/extract: LLM auto-tag classification ----------------------------
+
+#[tokio::test]
+async fn classify_names_maps_forms_and_normalizes() {
+    use felin_core::llm::{ChatMessage, LlmClient, LlmConfig};
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "[{\"japanese\":\"田中\",\"category\":\"人名\"},{\"japanese\":\"猫\",\"category\":\"物品\"},{\"japanese\":\"無し\",\"category\":\"\"}]"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = LlmClient::new(LlmConfig {
+        endpoint: server.uri(),
+        model: "test".into(),
+        api_key: "sk".into(),
+        timeout: Duration::from_secs(5),
+        max_retries: 1,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        temperature: None,
+        max_tokens: None,
+    })
+    .unwrap();
+
+    let tags = felin_core::names::classify_names(&client, &["田中".into(), "猫".into()], "分类助手").await;
+    assert_eq!(tags.len(), 2, "empty-category suggestion dropped");
+    let get = |jp: &str| tags.iter().find(|t| t.japanese == jp).map(|t| t.category.as_str());
+    assert_eq!(get("田中"), Some("人名"));
+    assert_eq!(get("猫"), Some("物品"));
+}
+
+#[tokio::test]
+async fn classify_names_refuses_empty_prompt() {
+    use felin_core::llm::{LlmClient, LlmConfig};
+    use std::time::Duration;
+    // Empty `classify_system` → no network call, no tags (找不到即报错 contract
+    // is the command's job; the helper just refuses loudly).
+    let client = LlmClient::new(LlmConfig {
+        endpoint: "http://127.0.0.1:1".into(),
+        model: "test".into(),
+        api_key: "sk".into(),
+        timeout: Duration::from_millis(50),
+        max_retries: 0,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        temperature: None,
+        max_tokens: None,
+    })
+    .unwrap();
+    let tags = felin_core::names::classify_names(&client, &["田中".into()], "  ").await;
+    assert!(tags.is_empty(), "no call must be made when the prompt is blank");
 }

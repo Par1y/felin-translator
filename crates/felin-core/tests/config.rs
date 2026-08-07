@@ -70,6 +70,10 @@ fn fresh_startup_felin_toml_is_spec_compliant() {
     assert!(parsed.prompt.translation_user.contains("{source}"));
     assert!(!parsed.prompt.extract_system.is_empty());
     assert!(parsed.prompt.extract_system.contains("JSON"));
+    // The auto-tag classifier ships with the factory prompt too (a fresh
+    // install can auto-tag out of the box).
+    assert!(!parsed.prompt.extract_tags_system.is_empty());
+    assert!(parsed.prompt.extract_tags_system.contains("JSON"));
 
     // Every technical section the config layer drives parses with the shipped values.
     assert_eq!(parsed.seg.default_block_size, 3000);
@@ -221,6 +225,7 @@ fn set_prompt_section_appends_when_missing() {
 
     let new_prompt = PromptConfig {
         extract_system: "自定义抽取".into(),
+        extract_tags_system: "自定义打标签".into(),
         translation_system: "自定义 system".into(),
         translation_user: "自定义 user".into(),
     };
@@ -264,6 +269,7 @@ fn set_prompt_section_replaces_existing_and_preserves_rest() {
 
     let new_prompt = PromptConfig {
         extract_system: "新抽取".into(),
+        extract_tags_system: "新打标签".into(),
         translation_system: "新 system".into(),
         translation_user: "新 user".into(),
     };

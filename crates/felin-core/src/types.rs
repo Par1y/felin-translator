@@ -349,5 +349,8 @@ pub struct ExtractedName {
     pub matched_name_id: Option<i64>,
     pub candidate_chinese: Option<String>,
     pub status: ExtractedNameStatus,
+    /// Category tags proposed by the LLM / edited by the user (人名、地名…).
+    /// Persisted in `extracted_names.tags` (JSON array).
+    pub tags: Vec<String>,
     pub notes: Option<String>,
 }

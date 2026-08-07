@@ -6,6 +6,7 @@ import {
   Checkbox,
   Input,
   InputNumber,
+  Modal,
   Progress,
   Segmented,
   Select,
@@ -51,6 +52,12 @@ const CSV_FIELD_ROWS: {
   { key: "notes", label: "备注", required: false },
 ];
 
+// Mirrors the `category` values the extraction / auto-tag prompts may output —
+// offered as quick-picks (the tags Select also allows free entry).
+const TAG_OPTIONS = ["人名", "地名", "组织", "作品名", "物品", "系统", "术语", "其他"].map(
+  (t) => ({ value: t, label: t }),
+);
+
 export default function ImportPage() {
   const { message } = AntdApp.useApp();
   const taskRef = useRef<string | null>(null);
@@ -79,6 +86,10 @@ export default function ImportPage() {
   const [candidates, setCandidates] = useState<ExtractedName[]>([]);
   const [confirmTarget, setConfirmTarget] = useState<GlossaryTarget>("project");
   const [selectedCand, setSelectedCand] = useState<React.Key[]>([]);
+  const [autoTagging, setAutoTagging] = useState(false);
+  // 批量标记 Modal：一次性给所有勾选的候选打上同一个标签。
+  const [batchTagOpen, setBatchTagOpen] = useState(false);
+  const [batchTag, setBatchTag] = useState<string[]>([]);
 
   // ---- ④ 专名 CSV 导入 ------------------------------------------------------
   const [csvPath, setCsvPath] = useState("");
@@ -377,6 +388,55 @@ export default function ImportPage() {
     }
   };
 
+  /// 手动触发：LLM 给勾选的候选自动打标签（每个候选只写第一个分类，已有标签不覆盖）。
+  const autoTag = async () => {
+    const ids = selectedCand.map(Number);
+    if (ids.length === 0) return;
+    setAutoTagging(true);
+    try {
+      const n = await api.autoTagExtracted(ids);
+      message.success(n > 0 ? `已自动打标签 ${n} 条` : "没有可打标签的候选（检查设置页「打标签 Prompt」）");
+      await loadCandidates();
+    } catch (e) {
+      message.error(String(e));
+    } finally {
+      setAutoTagging(false);
+    }
+  };
+
+  /// 批量标记：给勾选的候选全部写入同一个标签（复选框 + 全选 + 批量确认共用选择集）。
+  const applyBatchTag = async () => {
+    const ids = selectedCand.map(Number);
+    if (ids.length === 0) return;
+    try {
+      const n = await api.applyExtractedTags(ids, batchTag);
+      message.success(`已标记 ${n} 条`);
+      setBatchTagOpen(false);
+      setBatchTag([]);
+      setSelectedCand([]);
+      await loadCandidates();
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
+  const openBatchTag = () => {
+    if (selectedCand.length === 0) return;
+    setBatchTag([]);
+    setBatchTagOpen(true);
+  };
+
+  const setCandidateTags = async (id: number, tags: string[]) => {
+    try {
+      await api.updateExtractedTags(id, tags);
+      // Keep the local candidate list in sync so the controlled tags Select
+      // doesn't snap back to the stale server value on the next re-render.
+      setCandidates((prev) => prev.map((c) => (c.id === id ? { ...c, tags } : c)));
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
   const previewCsv = async () => {
     if (!csvPath.trim()) {
       message.warning("请输入 CSV 路径");
@@ -448,6 +508,22 @@ export default function ImportPage() {
                 .catch((err) => message.error(String(err)));
             }
           }}
+        />
+      ),
+    },
+    {
+      title: "标签",
+      dataIndex: "tags",
+      width: 200,
+      render: (v: string[], r) => (
+        <Select
+          size="small"
+          mode="tags"
+          style={{ width: "100%" }}
+          value={v ?? []}
+          placeholder="标签"
+          options={TAG_OPTIONS}
+          onChange={(tags: string[]) => void setCandidateTags(r.id, tags)}
         />
       ),
     },
@@ -715,6 +791,21 @@ export default function ImportPage() {
           </Button>
           <Button
             size="small"
+            loading={autoTagging}
+            disabled={selectedCand.length === 0}
+            onClick={() => void autoTag()}
+          >
+            自动打标签
+          </Button>
+          <Button
+            size="small"
+            disabled={selectedCand.length === 0}
+            onClick={openBatchTag}
+          >
+            批量标记
+          </Button>
+          <Button
+            size="small"
             danger
             disabled={selectedCand.length === 0}
             onClick={() => rejectCandidates()}
@@ -735,6 +826,31 @@ export default function ImportPage() {
           locale={{ emptyText: "暂无候选，先运行抽取" }}
         />
       </Card>
+
+      {/* 批量标记：给勾选的候选一次性写入同一个标签。 */}
+      <Modal
+        title={`批量标记 ${selectedCand.length} 条候选`}
+        open={batchTagOpen}
+        onOk={() => void applyBatchTag()}
+        onCancel={() => setBatchTagOpen(false)}
+        okText="标记"
+        cancelText="取消"
+        okButtonProps={{ disabled: batchTag.length === 0 }}
+      >
+        <Space direction="vertical" style={{ width: "100%" }}>
+          <Select
+            mode="tags"
+            style={{ width: "100%" }}
+            placeholder="选择或输入标签（如：人名）"
+            value={batchTag}
+            onChange={(v: string[]) => setBatchTag(v)}
+            options={TAG_OPTIONS}
+          />
+          <Typography.Text type="secondary">
+            所有勾选的候选都会被写入该标签；已存在的标签会被覆盖。
+          </Typography.Text>
+        </Space>
+      </Modal>
 
       {/* ④ 专名 CSV 导入：表头预览 + 逐字段列映射（未选列丢弃）+ 前几行预览 + 目标词库。 */}
       <Card title="专名 CSV 导入">

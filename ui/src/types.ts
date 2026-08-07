@@ -176,12 +176,15 @@ export const DEFAULT_IMAGE_RULE: ImageMatchRule = {
   range: null,
 };
 
+// Mirrors felin_core::types::ExtractedName (name-extraction candidates).
 export interface ExtractedName {
   id: number;
   japanese: string;
   matched_name_id: number | null;
   candidate_chinese: string | null;
   status: string;
+  /** Category tags proposed by the LLM / edited by the user (人名、地名…). */
+  tags: string[];
   notes: string | null;
 }
 
@@ -266,6 +269,8 @@ export interface TranslationSettings {
 // Empty field = that message section isn't sent.
 export interface PromptConfig {
   extract_system: string;
+  /** Name-classification message for the auto-tag pass (empty → auto-tag refuses). */
+  extract_tags_system: string;
   translation_system: string;
   translation_user: string;
 }

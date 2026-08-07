@@ -34,6 +34,7 @@ pub const PROJECT_MIGRATIONS: &[Migration] = &[
     Migration { version: 3, sql: include_str!("migrations/project/0003_glossary_entries.sql") },
     Migration { version: 4, sql: include_str!("migrations/project/0004_tu_source_override.sql") },
     Migration { version: 5, sql: include_str!("migrations/project/0005_remove_aliases.sql") },
+    Migration { version: 6, sql: include_str!("migrations/project/0006_extracted_tags.sql") },
 ];
 
 /// Typed wrapper over a single project's database.
@@ -782,19 +783,26 @@ impl ProjectDb {
     // ----- extracted proper-noun candidates -------------------------------
 
     /// Insert a candidate unless one with the same `japanese` already exists.
-    /// Returns the new row id, or `None` if it was a duplicate.
+    /// `category` is the tag proposed by the LLM (appended to the empty default
+    /// tags array). Returns the new row id, or `None` if it was a duplicate.
     pub fn insert_extracted(
         &self,
         japanese: &str,
         candidate_chinese: Option<&str>,
+        category: Option<&str>,
         notes: Option<&str>,
     ) -> Result<Option<i64>> {
         self.db.write(|c| {
             let changed = c.execute(
-                "INSERT INTO extracted_names (japanese, candidate_chinese, status, notes)
-                 SELECT ?1, ?2, 'new', ?3
+                "INSERT INTO extracted_names (japanese, candidate_chinese, status, tags, notes)
+                 SELECT ?1, ?2, 'new', ?3, ?4
                  WHERE NOT EXISTS (SELECT 1 FROM extracted_names WHERE japanese = ?1)",
-                rusqlite::params![japanese, candidate_chinese, notes],
+                rusqlite::params![
+                    japanese,
+                    candidate_chinese,
+                    serde_json::to_string(&tags_of(category)).unwrap_or_else(|_| "[]".into()),
+                    notes,
+                ],
             )?;
             Ok((changed > 0).then(|| c.last_insert_rowid()))
         })
@@ -807,7 +815,7 @@ impl ProjectDb {
             match status {
                 Some(s) => {
                     let mut stmt = c.prepare(
-                        "SELECT id, japanese, matched_name_id, candidate_chinese, status, notes
+                        "SELECT id, japanese, matched_name_id, candidate_chinese, status, tags, notes
                          FROM extracted_names WHERE status = ?1 ORDER BY id",
                     )?;
                     for row in stmt.query_map([s], row_to_extracted)? {
@@ -816,7 +824,7 @@ impl ProjectDb {
                 }
                 None => {
                     let mut stmt = c.prepare(
-                        "SELECT id, japanese, matched_name_id, candidate_chinese, status, notes
+                        "SELECT id, japanese, matched_name_id, candidate_chinese, status, tags, notes
                          FROM extracted_names ORDER BY id",
                     )?;
                     for row in stmt.query_map([], row_to_extracted)? {
@@ -832,7 +840,7 @@ impl ProjectDb {
     pub fn get_extracted(&self, id: i64) -> Result<Option<ExtractedName>> {
         self.db.read(|c| {
             c.query_row(
-                "SELECT id, japanese, matched_name_id, candidate_chinese, status, notes
+                "SELECT id, japanese, matched_name_id, candidate_chinese, status, tags, notes
                  FROM extracted_names WHERE id = ?1",
                 [id],
                 row_to_extracted,
@@ -865,6 +873,17 @@ impl ProjectDb {
             c.execute(
                 "UPDATE extracted_names SET candidate_chinese = ?1 WHERE id = ?2",
                 rusqlite::params![chinese, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Replace a candidate's category tags (JSON array).
+    pub fn set_extracted_tags(&self, id: i64, tags: &[String]) -> Result<()> {
+        self.db.write(|c| {
+            c.execute(
+                "UPDATE extracted_names SET tags = ?1 WHERE id = ?2",
+                rusqlite::params![serde_json::to_string(tags).unwrap_or_else(|_| "[]".into()), id],
             )?;
             Ok(())
         })
@@ -1318,14 +1337,28 @@ fn row_to_tu(r: &rusqlite::Row<'_>) -> rusqlite::Result<Tu> {
     })
 }
 
+/// A single non-empty category tag (or an empty vec when `category` is blank) —
+/// how the LLM-proposed category becomes the initial `tags` array on a new
+/// extracted candidate.
+fn tags_of(category: Option<&str>) -> Vec<String> {
+    category
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .into_iter()
+        .collect()
+}
+
 fn row_to_extracted(r: &rusqlite::Row<'_>) -> rusqlite::Result<ExtractedName> {
+    let tags_json: String = r.get(5)?;
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     Ok(ExtractedName {
         id: r.get(0)?,
         japanese: r.get(1)?,
         matched_name_id: r.get(2)?,
         candidate_chinese: r.get(3)?,
         status: r.get(4)?,
-        notes: r.get(5)?,
+        tags,
+        notes: r.get(6)?,
     })
 }
 

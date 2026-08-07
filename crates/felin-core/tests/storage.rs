@@ -184,6 +184,42 @@ fn old_v4_project_db_with_aliases_migrates_cleanly() {
 }
 
 #[test]
+fn old_v5_project_db_gains_extracted_tags_column() {
+    // Tolerance for an old project.db: it predates `extracted_names.tags`
+    // (schema v5). Reopening with the full migration set must run v6 — add the
+    // column with a JSON-array default — preserving existing candidates and
+    // never erroring.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("project.db");
+
+    {
+        let db = Db::open(
+            &path,
+            &felin_core::storage::PROJECT_MIGRATIONS[..5],
+            true,
+            DbTuning::default(),
+        )
+        .unwrap();
+        db.write(|c| {
+            c.execute(
+                "INSERT INTO extracted_names (japanese, candidate_chinese, status, notes)
+                 VALUES ('猫', '猫', 'new', '主人公のペット')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let p = ProjectDb::open(&path).unwrap();
+    let cands = p.list_extracted_names(None).unwrap();
+    assert_eq!(cands.len(), 1);
+    assert_eq!(cands[0].japanese, "猫");
+    // The migrated default is an empty tags array.
+    assert!(cands[0].tags.is_empty());
+}
+
+#[test]
 fn project_lock_is_exclusive_and_released_on_drop() {
     let dir = tempfile::tempdir().unwrap();
     let first = ProjectLock::acquire(dir.path()).unwrap();
@@ -207,17 +243,33 @@ fn glossary_and_extracted_names_roundtrip() {
     assert_eq!(g.list_names(10).unwrap().len(), 1);
 
     let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
-    assert!(p.insert_extracted("猫", Some("猫"), Some("主人公のペット")).unwrap().is_some());
+    assert!(p.insert_extracted("猫", Some("猫"), Some("物品"), Some("主人公のペット")).unwrap().is_some());
     // Same japanese is deduped.
-    assert!(p.insert_extracted("猫", Some("ねこ"), None).unwrap().is_none());
+    assert!(p.insert_extracted("猫", Some("ねこ"), None, None).unwrap().is_none());
 
     let new = p.list_extracted_names(Some(ExtractedNameStatus::New)).unwrap();
     assert_eq!(new.len(), 1);
+    // The category tag proposed by extraction is persisted as the initial tags.
+    assert_eq!(new[0].tags, vec!["物品".to_string()]);
     p.set_extracted_status(new[0].id, ExtractedNameStatus::Confirmed, Some(id)).unwrap();
     assert!(p.list_extracted_names(Some(ExtractedNameStatus::New)).unwrap().is_empty());
     let confirmed = p.list_extracted_names(Some(ExtractedNameStatus::Confirmed)).unwrap();
     assert_eq!(confirmed.len(), 1);
     assert_eq!(confirmed[0].matched_name_id, Some(id));
+}
+
+#[test]
+fn extracted_tags_are_editable_and_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let id = p.insert_extracted("佐藤", Some("佐藤"), None, None).unwrap().unwrap();
+    p.set_extracted_tags(id, &["人名".into(), "主角".into()]).unwrap();
+
+    // Reload from disk (new handle) — tags persist.
+    let p2 = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let got = p2.get_extracted(id).unwrap().unwrap();
+    assert_eq!(got.tags, vec!["人名".to_string(), "主角".to_string()]);
+    assert_eq!(got.japanese, "佐藤");
 }
 
 #[test]
@@ -592,7 +644,7 @@ fn batch_extracted_confirm_and_reject_via_storage() {
     let g = GlobalDb::open(&dir.path().join("glossary.db")).unwrap();
     let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
 
-    let mk = |jp: &str| p.insert_extracted(jp, Some(jp), None).unwrap().unwrap();
+    let mk = |jp: &str| p.insert_extracted(jp, Some(jp), None, None).unwrap().unwrap();
     let rej: Vec<i64> = ["誤字A", "誤字B", "誤字C"].iter().map(|jp| mk(jp)).collect();
     for id in &rej {
         p.set_extracted_status(*id, ExtractedNameStatus::Rejected, None).unwrap();

@@ -51,19 +51,20 @@ const STATUS_GROUPS: Record<string, string[]> = {
 /// One 「原文-译文」 proofreading card. Local edits are committed on blur; until
 /// the user edits (dirty), the card follows the server's latest value so live
 /// pipeline refreshes show up without clobbering in-progress typing.
+///
+/// One 勾选 (checkbox) drives the selection set (`selected`); the batch bar
+/// above the list decides whether the selected TUs are 重译 or 删除. The 专名
+/// the TU's source matched are rendered as colored tags (one per name), not a
+/// plain text line.
 function TuCard({
   tu,
   selected,
-  deleteSelected,
-  onToggleRetranslate,
-  onToggleDelete,
+  onToggleSelected,
   onChanged,
 }: {
   tu: TuWithTranslation;
   selected: boolean;
-  deleteSelected: boolean;
-  onToggleRetranslate: (id: number, checked: boolean) => void;
-  onToggleDelete: (id: number, checked: boolean) => void;
+  onToggleSelected: (id: number, checked: boolean) => void;
   onChanged: () => void;
 }) {
   const { message } = AntdApp.useApp();
@@ -117,10 +118,7 @@ function TuCard({
 
   /// The enabled small-glossary entries this TU's source hit — what prompt
   /// injection applied — rendered as 专名 tags under the 原文.
-  const matchedText =
-    (tu.matched_names ?? [])
-      .map((m) => (m.chinese && m.chinese.trim() ? `${m.japanese} → ${m.chinese}` : m.japanese))
-      .join(" / ") || "—";
+  const matched = tu.matched_names ?? [];
 
   return (
     <Card
@@ -132,17 +130,8 @@ function TuCard({
           {tu.translation_status && tu.translation_status !== "draft" && (
             <Typography.Text type="secondary">译态：{tu.translation_status}</Typography.Text>
           )}
-          <Checkbox
-            checked={selected}
-            onChange={(e) => onToggleRetranslate(tu.id, e.target.checked)}
-          >
-            重译
-          </Checkbox>
-          <Checkbox
-            checked={deleteSelected}
-            onChange={(e) => onToggleDelete(tu.id, e.target.checked)}
-          >
-            删除
+          <Checkbox checked={selected} onChange={(e) => onToggleSelected(tu.id, e.target.checked)}>
+            勾选
           </Checkbox>
         </Space>
       }
@@ -150,7 +139,7 @@ function TuCard({
     >
       {tu.error && (
         <Typography.Paragraph type="danger" style={{ marginBottom: 8 }}>
-          翻译失败：{tu.error}，可勾选「重译」
+          翻译失败：{tu.error}，可在上方批量「重译所选」或「删除所选」
         </Typography.Paragraph>
       )}
       <Space direction="vertical" style={{ width: "100%" }} size="small">
@@ -167,9 +156,26 @@ function TuCard({
             onBlur={commitSource}
             autoSize={{ minRows: 2, maxRows: 8 }}
           />
-          <Typography.Text type="secondary" style={{ display: "block", marginTop: 4, fontSize: 12 }}>
-            专名：{matchedText}
-          </Typography.Text>
+          {matched.length > 0 ? (
+            <div style={{ marginTop: 6 }}>
+              <Typography.Text type="secondary" style={{ fontSize: 12, marginRight: 6 }}>
+                专名：
+              </Typography.Text>
+              {matched.map((m, i) => (
+                <Tag
+                  key={`${m.japanese}-${i}`}
+                  color="geekblue"
+                  style={{ marginRight: 4, marginBottom: 2 }}
+                >
+                  {m.chinese && m.chinese.trim() ? `${m.japanese} → ${m.chinese}` : m.japanese}
+                </Tag>
+              ))}
+            </div>
+          ) : (
+            <Typography.Text type="secondary" style={{ display: "block", marginTop: 4, fontSize: 12 }}>
+              专名：—
+            </Typography.Text>
+          )}
         </div>
         <div>
           <Typography.Text type="secondary" style={{ display: "block", marginBottom: 4 }}>
@@ -210,8 +216,9 @@ export default function ReviewPage() {
   const [counts, setCounts] = useState<{ status: string; count: number }[]>([]);
   const [activeChapters, setActiveChapters] = useState<number[]>([]);
   const [tuRows, setTuRows] = useState<TuWithTranslation[]>([]);
-  const [retranslateIds, setRetranslateIds] = useState<Set<number>>(new Set());
-  const [deleteIds, setDeleteIds] = useState<Set<number>>(new Set());
+  /// Batch-selection set — the shared checkbox drives both 重译所选 and 删除所选
+  /// (both buttons live in the 翻译 bar above).
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [retranslateModal, setRetranslateModal] = useState(false);
   const [retranslateInstr, setRetranslateInstr] = useState("");
   const taskRef = useRef<string | null>(null);
@@ -251,7 +258,7 @@ export default function ReviewPage() {
   }, []);
 
   useEffect(() => {
-    setDeleteIds(new Set());
+    setSelectedIds(new Set());
     if (chapterId == null) {
       setTuRows([]);
       return;
@@ -364,8 +371,8 @@ export default function ReviewPage() {
     }
   };
 
-  const toggleRetranslate = (id: number, checked: boolean) => {
-    setRetranslateIds((prev) => {
+  const toggleSelected = (id: number, checked: boolean) => {
+    setSelectedIds((prev) => {
       const next = new Set(prev);
       if (checked) next.add(id);
       else next.delete(id);
@@ -373,12 +380,15 @@ export default function ReviewPage() {
     });
   };
 
+  /// The modal's 重译 applies to everything selected regardless of the batch
+  /// action toggle (the toggle only picks between 重译所选 and 删除所选 in the
+  /// batch bar).
   const confirmRetranslate = async () => {
-    const ids = [...retranslateIds];
+    const ids = [...selectedIds];
     try {
       const n = await api.retranslateTus(ids, retranslateInstr || undefined);
       message.success(`已重新入队 ${n} 个 TU`);
-      setRetranslateIds(new Set());
+      setSelectedIds(new Set());
       setRetranslateInstr("");
       setRetranslateModal(false);
       void refreshTranslation();
@@ -387,22 +397,13 @@ export default function ReviewPage() {
     }
   };
 
-  const toggleDelete = (id: number, checked: boolean) => {
-    setDeleteIds((prev) => {
-      const next = new Set(prev);
-      if (checked) next.add(id);
-      else next.delete(id);
-      return next;
-    });
-  };
-
   const confirmDelete = async () => {
-    const ids = [...deleteIds];
+    const ids = [...selectedIds];
     if (ids.length === 0) return;
     try {
       const n = await api.deleteTus(ids);
       message.success(`已删除 ${n} 个 TU（连同其段落）`);
-      setDeleteIds(new Set());
+      setSelectedIds(new Set());
       void refreshTranslation();
     } catch (e) {
       message.error(String(e));
@@ -412,8 +413,8 @@ export default function ReviewPage() {
   const groupStates = STATUS_GROUPS[group] ?? [];
   const shown = groupStates.length === 0 ? tuRows : tuRows.filter((t) => groupStates.includes(t.status));
   const totalCount = counts.reduce((a, c) => a + c.count, 0);
-  // Batch-delete selection state against the currently-shown TU cards.
-  const selectedShown = shown.filter((t) => deleteIds.has(t.id)).length;
+  // Batch-selection state against the currently-shown TU cards.
+  const selectedShown = shown.filter((t) => selectedIds.has(t.id)).length;
   const allShownSelected = shown.length > 0 && selectedShown === shown.length;
 
   return (
@@ -476,11 +477,24 @@ export default function ReviewPage() {
               重试失败项
             </Button>
             <Button
-              disabled={retranslateIds.size === 0}
+              disabled={selectedIds.size === 0}
               onClick={() => setRetranslateModal(true)}
             >
-              重译所选（{retranslateIds.size}）
+              重译所选（{selectedIds.size}）
             </Button>
+            <Popconfirm
+              title={`删除所选 ${selectedIds.size} 个段落？`}
+              description="将连同其原文段落一并删除，不可撤销。"
+              okText="删除"
+              cancelText="取消"
+              okButtonProps={{ danger: true }}
+              onConfirm={() => void confirmDelete()}
+              disabled={selectedIds.size === 0}
+            >
+              <Button danger disabled={selectedIds.size === 0}>
+                删除所选（{selectedIds.size}）
+              </Button>
+            </Popconfirm>
           </Space>
         }
       >
@@ -498,30 +512,17 @@ export default function ReviewPage() {
         </Space>
       </Card>
 
-      {/* ③ 可编辑 TU 卡片：每「原文-译文」一张卡片。 */}
+      {/* ③ 批量选择：一个勾选集，操作按钮「重译所选 / 删除所选」都在上方翻译栏。 */}
       <Space wrap style={{ marginBottom: 8 }}>
         <Checkbox
           checked={allShownSelected}
           indeterminate={selectedShown > 0 && !allShownSelected}
           onChange={(e) =>
-            setDeleteIds(e.target.checked ? new Set(shown.map((t) => t.id)) : new Set())
+            setSelectedIds(e.target.checked ? new Set(shown.map((t) => t.id)) : new Set())
           }
         >
-          全选
+          全选（当前筛选，{selectedShown}/{shown.length}）
         </Checkbox>
-        <Popconfirm
-          title={`删除所选 ${deleteIds.size} 个段落？`}
-          description="将连同其原文段落一并删除，不可撤销。"
-          okText="删除"
-          cancelText="取消"
-          okButtonProps={{ danger: true }}
-          onConfirm={() => void confirmDelete()}
-          disabled={deleteIds.size === 0}
-        >
-          <Button danger disabled={deleteIds.size === 0}>
-            删除所选（{deleteIds.size}）
-          </Button>
-        </Popconfirm>
       </Space>
       {shown.length === 0 ? (
         <Empty description="本章暂无 TU（请先自动分段，或切换筛选）" />
@@ -533,10 +534,8 @@ export default function ReviewPage() {
             <List.Item key={tu.id}>
               <TuCard
                 tu={tu}
-                selected={retranslateIds.has(tu.id)}
-                deleteSelected={deleteIds.has(tu.id)}
-                onToggleRetranslate={toggleRetranslate}
-                onToggleDelete={toggleDelete}
+                selected={selectedIds.has(tu.id)}
+                onToggleSelected={toggleSelected}
                 onChanged={() => void refreshTranslation()}
               />
             </List.Item>
@@ -544,9 +543,9 @@ export default function ReviewPage() {
         />
       )}
 
-      {/* 重译确认子菜单：可填额外指示。 */}
+      {/* 重译确认子菜单：可填额外指示（适用于当前所有勾选的 TU）。 */}
       <Modal
-        title={`重译所选 ${retranslateIds.size} 个 TU`}
+        title={`重译所选 ${selectedIds.size} 个 TU`}
         open={retranslateModal}
         onOk={() => void confirmRetranslate()}
         onCancel={() => setRetranslateModal(false)}
