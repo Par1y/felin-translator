@@ -195,13 +195,17 @@ async fn process_one<T: Translator + 'static>(
     stop: &mut watch::Receiver<bool>,
     tu_id: i64,
 ) {
-    // CAS claim; if we lose, another path (retry / user) already owns the TU.
-    if !db.claim_tu(tu_id).unwrap_or(false) {
+    // CAS claim (read-and-clear the explicit-retranslate flag in the same step);
+    // if we lose, another path (retry / user) already owns the TU.
+    let Ok((claimed, force_retranslate)) = db.claim_tu_explicit(tu_id) else {
+        return;
+    };
+    if !claimed {
         return;
     }
     let _ = events.send(PipelineEvent::TuStart { tu_id });
 
-    let outcome = match run_one(db, translator, cfg, guidelines, glossary, stop, tu_id).await {
+    let outcome = match run_one(db, translator, cfg, guidelines, glossary, stop, tu_id, force_retranslate).await {
         Ok(o) => o,
         Err(e) => {
             // DB-level failure: release the claim so the TU isn't stuck translating.
@@ -233,6 +237,7 @@ async fn run_one<T: Translator + 'static>(
     glossary: &Option<GlossaryMatcher>,
     stop: &mut watch::Receiver<bool>,
     tu_id: i64,
+    force_retranslate: bool,
 ) -> Result<Outcome> {
     let source = db.tu_source(tu_id)?;
     if source.trim().is_empty() {
@@ -241,8 +246,10 @@ async fn run_one<T: Translator + 'static>(
     }
     let hash = source_hash(&source);
 
-    // Translation memory: skip the LLM for a repeated, already-approved source.
-    if cfg.memory_dedup {
+    // Translation memory: skip the LLM for a repeated, already-approved source —
+    // UNLESS this TU was explicitly 重译-ed (`force_retranslate`), which demands
+    // a fresh LLM call no matter what memory holds.
+    if cfg.memory_dedup && !force_retranslate {
         if let Some((_, memorized)) = db.find_memory_hit(&hash)? {
             return match db.complete_translation(tu_id, memorized.trim(), &hash, true)? {
                 true => Ok(Outcome::Done { memory_hit: true }),

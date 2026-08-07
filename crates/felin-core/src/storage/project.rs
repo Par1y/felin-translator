@@ -35,6 +35,7 @@ pub const PROJECT_MIGRATIONS: &[Migration] = &[
     Migration { version: 4, sql: include_str!("migrations/project/0004_tu_source_override.sql") },
     Migration { version: 5, sql: include_str!("migrations/project/0005_remove_aliases.sql") },
     Migration { version: 6, sql: include_str!("migrations/project/0006_extracted_tags.sql") },
+    Migration { version: 7, sql: include_str!("migrations/project/0007_force_retranslate.sql") },
 ];
 
 /// Typed wrapper over a single project's database.
@@ -298,6 +299,34 @@ impl ProjectDb {
         })
     }
 
+    /// Atomically claim a TU **and** read-and-clear its `force_retranslate`
+    /// flag. Returns `(claimed, force)` — `force` tells the worker this TU was
+    /// explicitly 重译-ed, so it must perform a fresh LLM call instead of
+    /// reusing translation-memory. The flag is cleared in the same statement so
+    /// exactly one run honors it.
+    pub fn claim_tu_explicit(&self, id: i64) -> Result<(bool, bool)> {
+        self.db.write(|c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let claimed = tx.execute(
+                "UPDATE tus SET status = 'translating'
+                 WHERE id = ?1 AND status IN ('pending','queued')",
+                [id],
+            )? == 1;
+            if !claimed {
+                tx.rollback()?;
+                return Ok((false, false));
+            }
+            let force: i64 = tx.query_row(
+                "SELECT force_retranslate FROM tus WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            tx.execute("UPDATE tus SET force_retranslate = 0 WHERE id = ?1", [id])?;
+            tx.commit()?;
+            Ok((true, force != 0))
+        })
+    }
+
     /// Atomically write a translation result and release its TU — but only if
     /// the TU is still `translating`. If the user meanwhile moved it (e.g. to
     /// `reviewing`), the result is discarded and `Ok(false)` returned. This is
@@ -454,15 +483,19 @@ impl ProjectDb {
         })
     }
 
-    /// Re-translate: move a finished/failed TU back to `queued` with (optional)
-    /// per-item instruction, atomically. Returns false if the TU is mid-flight
-    /// (`pending`/`queued`/`translating`), which is not eligible.
+    /// Re-translate: move a finished/failed/never-translated TU back to `queued`
+    /// with (optional) per-item instruction, atomically, and mark it
+    /// `force_retranslate` so the pipeline performs a **fresh LLM call** even
+    /// when translation-memory would otherwise reuse an identical approved
+    /// source. Returns false if the TU is mid-flight (`translating`), which is
+    /// not eligible.
     pub fn retranslate_tu(&self, tu_id: i64, instruction: &str) -> Result<bool> {
         self.db.write(|conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let requeued = tx.execute(
-                "UPDATE tus SET status = 'queued' WHERE id = ?1 AND status IN
-                 ('translated','reviewing','approved','interrupted','failed_retryable','failed_permanent')",
+                "UPDATE tus SET status = 'queued', force_retranslate = 1
+                 WHERE id = ?1 AND status IN
+                 ('pending','queued','translated','reviewing','approved','interrupted','failed_retryable','failed_permanent')",
                 [tu_id],
             )? == 1;
             if !requeued {
@@ -504,10 +537,14 @@ impl ProjectDb {
         })
     }
 
-    /// Batch re-translate: requeue several finished/failed TUs in one transaction,
-    /// optionally stamping each with an extra instruction. The instruction is only
-    /// written when `Some` (pass `Some("")` to clear it). Returns how many TUs
-    /// were actually requeued.
+    /// Batch re-translate: requeue several finished/failed/never-translated TUs
+    /// in one transaction, optionally stamping each with an extra instruction.
+    /// Every requeued TU is marked `force_retranslate` so the pipeline makes a
+    /// fresh LLM call (never silently reuses translation-memory). The
+    /// instruction is only written when `Some` (pass `Some("")` to clear it).
+    /// Returns how many TUs were actually requeued — including `pending`/`queued`
+    /// ones, so the returned count matches what the user selected (mid-flight
+    /// `translating` TUs are the only exclusion).
     pub fn retranslate_tus(&self, ids: &[i64], instruction: Option<&str>) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
@@ -516,8 +553,8 @@ impl ProjectDb {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let mut n = 0usize;
             let mut stmt = tx.prepare(
-                "UPDATE tus SET status = 'queued' WHERE id = ?1 AND status IN
-                 ('translated','reviewing','approved','interrupted','failed_retryable','failed_permanent')",
+                "UPDATE tus SET status = 'queued', force_retranslate = 1 WHERE id = ?1 AND status IN
+                 ('pending','queued','translated','reviewing','approved','interrupted','failed_retryable','failed_permanent')",
             )?;
             for id in ids {
                 if stmt.execute([id])? == 1 {

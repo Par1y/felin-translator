@@ -55,9 +55,16 @@ const CSV_FIELD_ROWS: {
 
 // Mirrors the `category` values the extraction / auto-tag prompts may output —
 // offered as quick-picks (the tags Select also allows free entry).
-const TAG_OPTIONS = ["人名", "地名", "组织", "作品名", "物品", "系统", "术语", "其他"].map(
-  (t) => ({ value: t, label: t }),
-);
+const TAG_OPTIONS = [
+  "人名",
+  "地名",
+  "组织",
+  "作品名",
+  "物品",
+  "系统",
+  "术语",
+  "其他",
+].map((t) => ({ value: t, label: t }));
 
 export default function ImportPage() {
   const { message } = AntdApp.useApp();
@@ -342,8 +349,8 @@ export default function ImportPage() {
       await loadCandidates();
       message.success(
         confirmTarget === "project"
-          ? "已通过进项目小词库"
-          : "已通过进全局大词库",
+          ? "已加入至项目小词库"
+          : "已加入至全局大词库",
       );
     } catch (e) {
       message.error(String(e));
@@ -366,8 +373,8 @@ export default function ImportPage() {
       const n = await api.confirmExtractedBatch(ids, target);
       message.success(
         target === "project"
-          ? `已确认 ${n} 条进项目小词库`
-          : `已确认 ${n} 条进全局大词库`,
+          ? `已加入 ${n} 条至项目小词库`
+          : `已加入 ${n} 条至全局大词库`,
       );
       setSelectedCand([]);
       await loadCandidates();
@@ -396,7 +403,11 @@ export default function ImportPage() {
     setAutoTagging(true);
     try {
       const n = await api.autoTagExtracted(ids);
-      message.success(n > 0 ? `已自动打标签 ${n} 条` : "没有可打标签的候选（检查设置页「打标签 Prompt」）");
+      message.success(
+        n > 0
+          ? `已自动打标签 ${n} 条`
+          : "没有可打标签的候选（检查设置页「打标签 Prompt」）",
+      );
       await loadCandidates();
     } catch (e) {
       message.error(String(e));
@@ -432,7 +443,9 @@ export default function ImportPage() {
       await api.updateExtractedTags(id, tags);
       // Keep the local candidate list in sync so the controlled tags Select
       // doesn't snap back to the stale server value on the next re-render.
-      setCandidates((prev) => prev.map((c) => (c.id === id ? { ...c, tags } : c)));
+      setCandidates((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, tags } : c)),
+      );
     } catch (e) {
       message.error(String(e));
     }
@@ -494,7 +507,7 @@ export default function ImportPage() {
 
   const candidateColumns: TableProps<ExtractedName>["columns"] = [
     {
-      title: "日文（可改）",
+      title: "日文",
       dataIndex: "japanese",
       width: 220,
       render: (v: string, r) => (
@@ -524,7 +537,7 @@ export default function ImportPage() {
       ),
     },
     {
-      title: "中文（可改）",
+      title: "中文",
       dataIndex: "candidate_chinese",
       render: (v: string | null, r) => (
         <Input
@@ -567,7 +580,7 @@ export default function ImportPage() {
             type="link"
             onClick={() => confirmCandidate(r.id)}
           >
-            通过
+            加入
           </Button>
           <Button
             size="small"
@@ -644,7 +657,10 @@ export default function ImportPage() {
                       title: "选择 PDF / 图片文件",
                       filters: [
                         { name: "文档", extensions: ["pdf"] },
-                        { name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] },
+                        {
+                          name: "图片",
+                          extensions: ["png", "jpg", "jpeg", "webp"],
+                        },
                       ],
                     });
                     if (p) setPdfPath(p);
@@ -693,7 +709,7 @@ export default function ImportPage() {
                     { value: "png", label: "仅 PNG" },
                     { value: "jpg", label: "仅 JPG/JPEG" },
                     { value: "numbered", label: "纯数字文件名" },
-                    { value: "numbered_prefix", label: "数字开头文件名" },
+                    { value: "numbered_prefix", label: "以数字开头的文件名" },
                   ]}
                 />
                 <Input
@@ -732,7 +748,7 @@ export default function ImportPage() {
                   清除范围
                 </Button>
                 <Button loading={scanning} onClick={scanDir}>
-                  扫描预览
+                  预览
                 </Button>
               </Space>
               {selection && (
@@ -825,18 +841,18 @@ export default function ImportPage() {
         title="专名抽取与校对"
         extra={
           <Space>
-            <span>通过目标：</span>
+            <span>加入：</span>
             <Select
               style={{ width: 160 }}
               value={confirmTarget}
               onChange={(v) => setConfirmTarget(v)}
               options={[
-                { value: "project", label: "项目小词库" },
-                { value: "global", label: "全局大词库" },
+                { value: "project", label: "项目词库" },
+                { value: "global", label: "全局词库" },
               ]}
             />
             <Button type="primary" loading={extracting} onClick={runExtract}>
-              运行抽取
+              进行抽取
             </Button>
           </Space>
         }
@@ -847,14 +863,14 @@ export default function ImportPage() {
             disabled={selectedCand.length === 0}
             onClick={() => confirmCandidates("project")}
           >
-            确认所选进小词库
+            加入至项目词库
           </Button>
           <Button
             size="small"
             disabled={selectedCand.length === 0}
             onClick={() => confirmCandidates("global")}
           >
-            确认所选进大词库
+            加入至全局词库
           </Button>
           <Button
             size="small"
@@ -862,14 +878,14 @@ export default function ImportPage() {
             disabled={selectedCand.length === 0}
             onClick={() => void autoTag()}
           >
-            自动打标签
+            AI 标签
           </Button>
           <Button
             size="small"
             disabled={selectedCand.length === 0}
             onClick={openBatchTag}
           >
-            批量标记
+            批量标签
           </Button>
           <Button
             size="small"
@@ -890,17 +906,17 @@ export default function ImportPage() {
             onChange: setSelectedCand,
           }}
           pagination={{ pageSize: 10 }}
-          locale={{ emptyText: "暂无候选，先运行抽取" }}
+          locale={{ emptyText: "暂无候选，请先进行抽取" }}
         />
       </Card>
 
-      {/* 批量标记：给勾选的候选一次性写入同一个标签。 */}
+      {/* 批量标签：给勾选的候选一次性写入同一个标签。 */}
       <Modal
-        title={`批量标记 ${selectedCand.length} 条候选`}
+        title={`批量标签 ${selectedCand.length} 条候选`}
         open={batchTagOpen}
         onOk={() => void applyBatchTag()}
         onCancel={() => setBatchTagOpen(false)}
-        okText="标记"
+        okText="打标签"
         cancelText="取消"
         okButtonProps={{ disabled: batchTag.length === 0 }}
       >
@@ -995,7 +1011,7 @@ export default function ImportPage() {
                             ...csvColumnOptions,
                           ]
                     }
-                    placeholder={f.required ? "请选择列" : "不使用（可选）"}
+                    placeholder={f.required ? "请选择列" : "不使用"}
                   />
                 </Space>
               ))}

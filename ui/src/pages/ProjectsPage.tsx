@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
-import { App as AntdApp, Button, Card, Empty, Input, List, Modal, Popconfirm, Space, Tag, Typography } from "antd";
+import {
+  App as AntdApp,
+  Button,
+  Card,
+  Empty,
+  Input,
+  List,
+  Modal,
+  Popconfirm,
+  Space,
+  Tag,
+  Typography,
+} from "antd";
 import type { ProjectSummary } from "../types";
 import { api } from "../api";
 import { pickFile } from "../dialog";
@@ -130,11 +142,15 @@ export default function ProjectsPage({
   };
 
   return (
-    <Space direction="vertical" size="large" style={{ width: "100%", maxWidth: 800 }}>
+    <Space
+      direction="vertical"
+      size="large"
+      style={{ width: "100%", maxWidth: 800 }}
+    >
       <Card title="新建项目">
         <Space.Compact style={{ width: "100%" }}>
           <Input
-            placeholder="项目名称（例：少女民俗学）"
+            placeholder="项目名称"
             value={name}
             onChange={(e) => setName(e.target.value)}
             onPressEnter={create}
@@ -145,7 +161,10 @@ export default function ProjectsPage({
         </Space.Compact>
       </Card>
 
-      <Card title="项目列表" extra={project ? <Button onClick={close}>关闭当前</Button> : null}>
+      <Card
+        title="项目列表"
+        extra={project ? <Button onClick={close}>关闭当前</Button> : null}
+      >
         {projects.length === 0 ? (
           <Empty description="还没有项目" />
         ) : (
@@ -162,7 +181,11 @@ export default function ProjectsPage({
                   >
                     {project?.slug === p.slug ? "已打开" : "打开"}
                   </Button>,
-                  <Button key="rename" type="link" onClick={() => openRename(p)}>
+                  <Button
+                    key="rename"
+                    type="link"
+                    onClick={() => openRename(p)}
+                  >
                     重命名
                   </Button>,
                   <Popconfirm

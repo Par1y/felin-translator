@@ -400,9 +400,23 @@ pub struct TranslationStatusView {
 /// (which wake a running scheduler via the stored [`Notify`]).
 #[tauri::command]
 pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    match spawn_translation(&app, &state)? {
+        Some(task_id) => Ok(task_id),
+        None => Err("translation already running".into()),
+    }
+}
+
+/// Spawn a translation run over the open project's eligible TUs. Returns
+/// `Some(task_id)` when a run was started, `None` when one is already active.
+/// Progress arrives via `translation://progress`, completion via
+/// `translation://done` / `translation://error`. Shared by `start_translation`
+/// (which errors on "already running") and the retranslate/retry commands
+/// (which start a run on demand so requeued TUs are picked up even when the
+/// pipeline is idle).
+fn spawn_translation(app: &tauri::AppHandle, state: &AppState) -> Result<Option<String>, String> {
     // One run at a time; the run thread deregisters itself when it finishes.
     if state.translation_guard().is_some() {
-        return Err("translation already running".into());
+        return Ok(None);
     }
     // Capture everything the run thread needs under the project lock. Glossary
     // data for prompt injection is fetched by the pipeline itself from the
@@ -451,7 +465,7 @@ pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<S
         // RAII: always clear the translation-run slot, on every exit path, but
         // only if it's still *this* run (a later run must not be clobbered).
         struct Dereg {
-            app: AppHandle,
+            app: tauri::AppHandle,
             tid: String,
         }
         impl Drop for Dereg {
@@ -514,7 +528,7 @@ pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<S
         }
     });
 
-    Ok(task_id)
+    Ok(Some(task_id))
 }
 
 /// Relay pipeline progress events to the frontend (`translation://progress`).
@@ -576,9 +590,11 @@ pub fn translation_status(state: State<'_, AppState>) -> Result<TranslationStatu
 
 /// Explicit retry: re-queue `failed_*`/`interrupted` TUs, scoped to
 /// `scope` = `"tu"` (ids), `"chapter"` (ids[0]), or `"all"`. Returns how many
-/// were re-queued. If a run is active, its scheduler is woken to re-scan.
+/// were re-queued. If a run is active its scheduler is woken; if the pipeline
+/// is idle a run is started so the requeued TUs actually proceed.
 #[tauri::command]
 pub fn retry_translation(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     scope: String,
     ids: Vec<i64>,
@@ -597,8 +613,15 @@ pub fn retry_translation(
         }),
     })?;
     if requeued > 0 {
-        if let Some(run) = state.translation_guard().as_ref() {
-            run.wake.notify_one();
+        // Wake an active run, or start one if the pipeline is idle (else the
+        // requeued TUs would sit `queued` forever with nothing to pick them up).
+        let run_active = state.translation_guard().is_some();
+        if run_active {
+            if let Some(run) = state.translation_guard().as_ref() {
+                run.wake.notify_one();
+            }
+        } else {
+            let _ = spawn_translation(&app, &state);
         }
     }
     Ok(requeued)
@@ -621,18 +644,24 @@ pub fn set_tu_instruction(
 }
 
 /// Re-translate one TU: move it back to `queued` (with optional per-item
-/// instruction) and wake the scheduler if a run is active. Returns false if the
-/// TU is mid-flight (`pending`/`queued`/`translating`).
+/// instruction) and mark it for a fresh LLM call. Returns false if the TU is
+/// mid-flight (`translating`). If a run is active its scheduler is woken; if
+/// the pipeline is idle a run is started so the requeued TU actually proceeds.
 #[tauri::command]
 pub fn retranslate_tu(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     tu_id: i64,
     instruction: String,
 ) -> Result<bool, String> {
     let ok = with_project(&state, |p| p.db.retranslate_tu(tu_id, &instruction))?;
     if ok {
-        if let Some(run) = state.translation_guard().as_ref() {
-            run.wake.notify_one();
+        if state.translation_guard().is_some() {
+            if let Some(run) = state.translation_guard().as_ref() {
+                run.wake.notify_one();
+            }
+        } else {
+            let _ = spawn_translation(&app, &state);
         }
     }
     Ok(ok)
@@ -725,18 +754,26 @@ pub fn delete_tus(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, St
 }
 
 /// Re-translate a batch of TUs: requeue each (with an optional per-run
-/// instruction) and wake a running scheduler so it re-scans immediately.
-/// Returns how many were actually requeued (mid-flight TUs are skipped).
+/// instruction) and mark them for a fresh LLM call. If a run is active its
+/// scheduler is woken; if the pipeline is idle a run is started so the requeued
+/// TUs actually proceed. Returns how many were requeued (mid-flight `translating`
+/// TUs are the only exclusion; the count therefore matches what the user
+/// selected).
 #[tauri::command]
 pub fn retranslate_tus(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     ids: Vec<i64>,
     instruction: Option<String>,
 ) -> Result<usize, String> {
     let n = with_project(&state, |p| p.db.retranslate_tus(&ids, instruction.as_deref()))?;
     if n > 0 {
-        if let Some(run) = state.translation_guard().as_ref() {
-            run.wake.notify_one();
+        if state.translation_guard().is_some() {
+            if let Some(run) = state.translation_guard().as_ref() {
+                run.wake.notify_one();
+            }
+        } else {
+            let _ = spawn_translation(&app, &state);
         }
     }
     Ok(n)

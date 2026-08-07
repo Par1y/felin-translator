@@ -83,7 +83,13 @@ export default function NamesPage() {
   const openEdit = (e?: GlossaryEntry) => {
     if (!e) {
       setEditId(null);
-      setEditForm({ japanese: "", chinese: "", english: "", tags: [], notes: "" });
+      setEditForm({
+        japanese: "",
+        chinese: "",
+        english: "",
+        tags: [],
+        notes: "",
+      });
     } else {
       setEditId(e.id);
       setEditForm({
@@ -112,7 +118,8 @@ export default function NamesPage() {
       notes: editForm.notes.trim() || null,
     };
     try {
-      if (editId == null) await api.addGlossaryEntry({ ...input, name_global_id: null });
+      if (editId == null)
+        await api.addGlossaryEntry({ ...input, name_global_id: null });
       else await api.updateGlossaryEntry(editId, input);
       message.success("已保存");
       setEditOpen(false);
@@ -137,8 +144,11 @@ export default function NamesPage() {
       return;
     }
     try {
-      for (const id of selectedKeys) await api.setEntryEnabled(Number(id), enabled);
-      message.success(`已${enabled ? "启用" : "禁用"} ${selectedKeys.length} 条`);
+      for (const id of selectedKeys)
+        await api.setEntryEnabled(Number(id), enabled);
+      message.success(
+        `已${enabled ? "启用" : "禁用"} ${selectedKeys.length} 条`,
+      );
       setSelectedKeys([]);
       await loadEntries(q.trim() || undefined);
     } catch (e) {
@@ -231,14 +241,23 @@ export default function NamesPage() {
 
   const entryColumns: TableProps<GlossaryEntry>["columns"] = [
     { title: "日文", dataIndex: "japanese", width: 200 },
-    { title: "中文", dataIndex: "chinese", width: 160, render: (v: string | null) => v ?? "—" },
+    {
+      title: "中文",
+      dataIndex: "chinese",
+      width: 160,
+      render: (v: string | null) => v ?? "—",
+    },
     { title: "标签", dataIndex: "tags", render: (v: string[]) => tagsOf(v) },
     {
       title: "启用",
       dataIndex: "enabled",
       width: 70,
       render: (v: boolean, r) => (
-        <Switch size="small" checked={v} onChange={(c) => toggleEnabled(r.id, c)} />
+        <Switch
+          size="small"
+          checked={v}
+          onChange={(c) => toggleEnabled(r.id, c)}
+        />
       ),
     },
     {
@@ -249,7 +268,12 @@ export default function NamesPage() {
           <Button size="small" type="link" onClick={() => openEdit(r)}>
             编辑
           </Button>
-          <Button size="small" type="link" danger onClick={() => deleteEntry(r.id)}>
+          <Button
+            size="small"
+            type="link"
+            danger
+            onClick={() => deleteEntry(r.id)}
+          >
             删除
           </Button>
         </Space>
@@ -259,13 +283,30 @@ export default function NamesPage() {
 
   const globalColumns: TableProps<GlossaryName>["columns"] = [
     { title: "日文", dataIndex: "japanese", width: 200 },
-    { title: "中文", dataIndex: "chinese", width: 160, render: (v: string | null) => v ?? "—" },
-    { title: "来源", dataIndex: "source", width: 160, render: (v: string | null) => v ?? "—" },
+    {
+      title: "中文",
+      dataIndex: "chinese",
+      width: 160,
+      render: (v: string | null) => v ?? "—",
+    },
+    {
+      title: "来源",
+      dataIndex: "source",
+      width: 160,
+      render: (v: string | null) => v ?? "—",
+    },
     {
       title: "标签",
       dataIndex: "tags",
       render: (v: string[], r) => (
-        <Button size="small" type="link" onClick={() => { setTagEdit(r); setTagDraft(v); }}>
+        <Button
+          size="small"
+          type="link"
+          onClick={() => {
+            setTagEdit(r);
+            setTagDraft(v);
+          }}
+        >
           {v.length > 0 ? tagsOf(v) : "添加标签"}
         </Button>
       ),
@@ -275,23 +316,31 @@ export default function NamesPage() {
       dataIndex: "enabled",
       width: 70,
       render: (v: boolean, r) => (
-        <Switch size="small" checked={v} onChange={(c) => toggleGlobalEnabled(r.id, c)} />
+        <Switch
+          size="small"
+          checked={v}
+          onChange={(c) => toggleGlobalEnabled(r.id, c)}
+        />
       ),
     },
   ];
 
   return (
-    <Space direction="vertical" size="large" style={{ width: "100%", maxWidth: 1000 }}>
+    <Space
+      direction="vertical"
+      size="large"
+      style={{ width: "100%", maxWidth: 1000 }}
+    >
       <Tabs
         activeKey={tab}
         onChange={setTab}
         items={[
           {
             key: "project",
-            label: "项目小词库",
+            label: "项目词库",
             children: (
               <Card
-                title="项目小词库"
+                title="项目词库"
                 extra={
                   <Space wrap>
                     <Input.Search
@@ -303,12 +352,18 @@ export default function NamesPage() {
                       style={{ width: 220 }}
                     />
                     <Button onClick={() => openEdit()}>新建</Button>
-                    <Button onClick={() => setFromGlobalOpen(true)}>从全局搜索添加</Button>
-                    <Button onClick={() => batchSetEnabled(true)}>批量启用</Button>
-                    <Button onClick={() => batchSetEnabled(false)}>批量禁用</Button>
+                    <Button onClick={() => setFromGlobalOpen(true)}>
+                      从全局搜索添加
+                    </Button>
+                    <Button onClick={() => batchSetEnabled(true)}>
+                      批量启用
+                    </Button>
+                    <Button onClick={() => batchSetEnabled(false)}>
+                      批量禁用
+                    </Button>
                     <Popconfirm
                       title={`删除所选 ${selectedKeys.length} 个词条？`}
-                      description="将从项目小词库移除，此操作不可撤销。"
+                      description="将从项目词库移除，此操作不可撤销。"
                       okText="删除"
                       cancelText="取消"
                       okButtonProps={{ danger: true }}
@@ -327,11 +382,17 @@ export default function NamesPage() {
                   size="small"
                   columns={entryColumns}
                   dataSource={entries}
-                  rowSelection={{ selectedRowKeys: selectedKeys, onChange: setSelectedKeys }}
+                  rowSelection={{
+                    selectedRowKeys: selectedKeys,
+                    onChange: setSelectedKeys,
+                  }}
                   pagination={{ pageSize: 10 }}
                   locale={{ emptyText: "暂无词条" }}
                 />
-                <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                <Typography.Paragraph
+                  type="secondary"
+                  style={{ marginBottom: 0 }}
+                >
                   翻译 prompt 只注入本词库中「启用」的词条；禁用后不再注入。
                 </Typography.Paragraph>
               </Card>
@@ -339,10 +400,10 @@ export default function NamesPage() {
           },
           {
             key: "global",
-            label: "全局大词库",
+            label: "全局词库",
             children: (
               <Card
-                title="全局大词库"
+                title="全局词库"
                 extra={
                   <Space wrap>
                     <Input.Search
@@ -355,7 +416,7 @@ export default function NamesPage() {
                     />
                     <Popconfirm
                       title={`删除所选 ${globalSelectedKeys.length} 个全局词条？`}
-                      description="将从全局大词库移除（各项目对它的引用会被清除），此操作不可撤销。"
+                      description="将从全局词库移除（各项目对它的引用会被清除），此操作不可撤销。"
                       okText="删除"
                       cancelText="取消"
                       okButtonProps={{ danger: true }}
@@ -374,12 +435,19 @@ export default function NamesPage() {
                   size="small"
                   columns={globalColumns}
                   dataSource={globalNames}
-                  rowSelection={{ selectedRowKeys: globalSelectedKeys, onChange: setGlobalSelectedKeys }}
+                  rowSelection={{
+                    selectedRowKeys: globalSelectedKeys,
+                    onChange: setGlobalSelectedKeys,
+                  }}
                   pagination={{ pageSize: 10 }}
                   locale={{ emptyText: "暂无词条" }}
                 />
-                <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                  全局共享词库不直接注入翻译 prompt；需要时从全局「添加」到项目小词库。
+                <Typography.Paragraph
+                  type="secondary"
+                  style={{ marginBottom: 0 }}
+                >
+                  全局共享词库不直接注入翻译
+                  prompt；需要时从全局「添加」到项目小词库。
                 </Typography.Paragraph>
               </Card>
             ),
@@ -397,9 +465,27 @@ export default function NamesPage() {
         cancelText="取消"
       >
         <Space direction="vertical" style={{ width: "100%" }}>
-          <Input addonBefore="日文" value={editForm.japanese} onChange={(e) => setEditForm({ ...editForm, japanese: e.target.value })} />
-          <Input addonBefore="中文" value={editForm.chinese} onChange={(e) => setEditForm({ ...editForm, chinese: e.target.value })} />
-          <Input addonBefore="英文" value={editForm.english} onChange={(e) => setEditForm({ ...editForm, english: e.target.value })} />
+          <Input
+            addonBefore="日文"
+            value={editForm.japanese}
+            onChange={(e) =>
+              setEditForm({ ...editForm, japanese: e.target.value })
+            }
+          />
+          <Input
+            addonBefore="中文"
+            value={editForm.chinese}
+            onChange={(e) =>
+              setEditForm({ ...editForm, chinese: e.target.value })
+            }
+          />
+          <Input
+            addonBefore="英文"
+            value={editForm.english}
+            onChange={(e) =>
+              setEditForm({ ...editForm, english: e.target.value })
+            }
+          />
           <Select
             mode="tags"
             placeholder="标签（回车添加；第一个标签作为类别，如：人名）"
@@ -408,7 +494,12 @@ export default function NamesPage() {
             style={{ width: "100%" }}
           />
           <Typography.Text>备注</Typography.Text>
-          <Input.TextArea value={editForm.notes} onChange={(e) => setEditForm({ ...editForm, notes: e.target.value })} />
+          <Input.TextArea
+            value={editForm.notes}
+            onChange={(e) =>
+              setEditForm({ ...editForm, notes: e.target.value })
+            }
+          />
         </Space>
       </Modal>
 
@@ -431,14 +522,20 @@ export default function NamesPage() {
             renderItem={(g) => (
               <List.Item
                 actions={[
-                  <Button size="small" type="primary" onClick={() => addFromGlobal(g)}>
+                  <Button
+                    size="small"
+                    type="primary"
+                    onClick={() => addFromGlobal(g)}
+                  >
                     添加
                   </Button>,
                 ]}
               >
                 <Space wrap>
                   <Typography.Text>{g.japanese}</Typography.Text>
-                  <Typography.Text type="secondary">→ {g.chinese ?? "—"}</Typography.Text>
+                  <Typography.Text type="secondary">
+                    → {g.chinese ?? "—"}
+                  </Typography.Text>
                   {tagsOf(g.tags)}
                 </Space>
               </List.Item>

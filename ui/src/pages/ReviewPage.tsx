@@ -19,7 +19,12 @@ import {
 } from "antd";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { Chapter, TuWithTranslation } from "../types";
-import { api, onTranslationDone, onTranslationError, onTranslationProgress } from "../api";
+import {
+  api,
+  onTranslationDone,
+  onTranslationError,
+  onTranslationProgress,
+} from "../api";
 
 /// TU state → friendly 中文 label + tag color for the proofreading cards.
 function tuStatusView(s: string): { text: string; color: string } {
@@ -96,7 +101,7 @@ function TuCard({
     try {
       const demoted = await api.setTranslationText(tu.id, trans);
       setDirty(false);
-      if (demoted) message.info("译文已保存（该 TU 已回到校对状态）");
+      if (demoted) message.info("译文已保存（该条已回到校对状态）");
       else message.success("译文已保存");
       onChanged();
     } catch (e) {
@@ -128,9 +133,14 @@ function TuCard({
           <Tag color={status.color}>{status.text}</Tag>
           <Typography.Text type="secondary">#{tu.ord + 1}</Typography.Text>
           {tu.translation_status && tu.translation_status !== "draft" && (
-            <Typography.Text type="secondary">译态：{tu.translation_status}</Typography.Text>
+            <Typography.Text type="secondary">
+              译态：{tu.translation_status}
+            </Typography.Text>
           )}
-          <Checkbox checked={selected} onChange={(e) => onToggleSelected(tu.id, e.target.checked)}>
+          <Checkbox
+            checked={selected}
+            onChange={(e) => onToggleSelected(tu.id, e.target.checked)}
+          >
             勾选
           </Checkbox>
         </Space>
@@ -144,7 +154,10 @@ function TuCard({
       )}
       <Space direction="vertical" style={{ width: "100%" }} size="small">
         <div>
-          <Typography.Text type="secondary" style={{ display: "block", marginBottom: 4 }}>
+          <Typography.Text
+            type="secondary"
+            style={{ display: "block", marginBottom: 4 }}
+          >
             原文（可改，留空恢复段落原文）
           </Typography.Text>
           <Input.TextArea
@@ -158,7 +171,10 @@ function TuCard({
           />
           {matched.length > 0 ? (
             <div style={{ marginTop: 6 }}>
-              <Typography.Text type="secondary" style={{ fontSize: 12, marginRight: 6 }}>
+              <Typography.Text
+                type="secondary"
+                style={{ fontSize: 12, marginRight: 6 }}
+              >
                 专名：
               </Typography.Text>
               {matched.map((m, i) => (
@@ -167,18 +183,26 @@ function TuCard({
                   color="geekblue"
                   style={{ marginRight: 4, marginBottom: 2 }}
                 >
-                  {m.chinese && m.chinese.trim() ? `${m.japanese} → ${m.chinese}` : m.japanese}
+                  {m.chinese && m.chinese.trim()
+                    ? `${m.japanese} → ${m.chinese}`
+                    : m.japanese}
                 </Tag>
               ))}
             </div>
           ) : (
-            <Typography.Text type="secondary" style={{ display: "block", marginTop: 4, fontSize: 12 }}>
+            <Typography.Text
+              type="secondary"
+              style={{ display: "block", marginTop: 4, fontSize: 12 }}
+            >
               专名：—
             </Typography.Text>
           )}
         </div>
         <div>
-          <Typography.Text type="secondary" style={{ display: "block", marginBottom: 4 }}>
+          <Typography.Text
+            type="secondary"
+            style={{ display: "block", marginBottom: 4 }}
+          >
             译文（可改）
           </Typography.Text>
           <Input.TextArea
@@ -192,7 +216,12 @@ function TuCard({
           />
         </div>
         <Space>
-          <Button size="small" type="primary" disabled={tu.status === "approved"} onClick={approve}>
+          <Button
+            size="small"
+            type="primary"
+            disabled={tu.status === "approved"}
+            onClick={approve}
+          >
             通过
           </Button>
         </Space>
@@ -237,7 +266,9 @@ export default function ReviewPage() {
       try {
         const chs = await api.listChapters();
         setChapters(chs);
-        setChapterId((cur) => (selectFirst || cur == null ? (chs[0]?.id ?? null) : cur));
+        setChapterId((cur) =>
+          selectFirst || cur == null ? (chs[0]?.id ?? null) : cur,
+        );
       } catch (e) {
         message.error(String(e));
       }
@@ -328,7 +359,7 @@ export default function ReviewPage() {
     setSegmenting(true);
     try {
       const r = await api.segmentProject(blockSize);
-      message.success(`已分段：${r.chapters} 章，${r.tus} 个 TU`);
+      message.success(`已分段：${r.chapters} 章，${r.tus} 条`);
       await loadChapters(true);
     } catch (e) {
       message.error(String(e));
@@ -355,7 +386,7 @@ export default function ReviewPage() {
   const stop = async () => {
     try {
       await api.stopTranslation();
-      message.info("已请求停止（在飞项按设置完成或中断）");
+      message.info("已请求停止");
     } catch (e) {
       message.error(String(e));
     }
@@ -364,7 +395,7 @@ export default function ReviewPage() {
   const retryAll = async () => {
     try {
       const n = await api.retryTranslation("all", []);
-      message.success(`已重新入队 ${n} 个 TU`);
+      message.success(`已重新入队 ${n} 条`);
       void refreshTranslation();
     } catch (e) {
       message.error(String(e));
@@ -387,7 +418,7 @@ export default function ReviewPage() {
     const ids = [...selectedIds];
     try {
       const n = await api.retranslateTus(ids, retranslateInstr || undefined);
-      message.success(`已重新入队 ${n} 个 TU`);
+      message.success(`已重新入队 ${n} 条`);
       setSelectedIds(new Set());
       setRetranslateInstr("");
       setRetranslateModal(false);
@@ -411,14 +442,21 @@ export default function ReviewPage() {
   };
 
   const groupStates = STATUS_GROUPS[group] ?? [];
-  const shown = groupStates.length === 0 ? tuRows : tuRows.filter((t) => groupStates.includes(t.status));
+  const shown =
+    groupStates.length === 0
+      ? tuRows
+      : tuRows.filter((t) => groupStates.includes(t.status));
   const totalCount = counts.reduce((a, c) => a + c.count, 0);
   // Batch-selection state against the currently-shown TU cards.
   const selectedShown = shown.filter((t) => selectedIds.has(t.id)).length;
   const allShownSelected = shown.length > 0 && selectedShown === shown.length;
 
   return (
-    <Space direction="vertical" size="large" style={{ width: "100%", maxWidth: 900 }}>
+    <Space
+      direction="vertical"
+      size="large"
+      style={{ width: "100%", maxWidth: 900 }}
+    >
       {/* ① 分段：块大小 + 自动分段 + 章节选择 + 状态过滤。 */}
       <Card title="分段与选择">
         <Space wrap>
@@ -500,9 +538,13 @@ export default function ReviewPage() {
       >
         <Space wrap>
           {running ? <Tag color="processing">运行中</Tag> : <Tag>未运行</Tag>}
-          {activeChapters.length > 0 && <Tag>激活章：{activeChapters.join(", ")}</Tag>}
+          {activeChapters.length > 0 && (
+            <Tag>激活章：{activeChapters.join(", ")}</Tag>
+          )}
           {totalCount > 0 && (
-            <Typography.Text type="secondary">共 {totalCount} 个 TU</Typography.Text>
+            <Typography.Text type="secondary">
+              共 {totalCount} 条
+            </Typography.Text>
           )}
           {counts.map((c) => (
             <Tag key={c.status} color={tuStatusView(c.status).color}>
@@ -518,7 +560,9 @@ export default function ReviewPage() {
           checked={allShownSelected}
           indeterminate={selectedShown > 0 && !allShownSelected}
           onChange={(e) =>
-            setSelectedIds(e.target.checked ? new Set(shown.map((t) => t.id)) : new Set())
+            setSelectedIds(
+              e.target.checked ? new Set(shown.map((t) => t.id)) : new Set(),
+            )
           }
         >
           全选（当前筛选，{selectedShown}/{shown.length}）
@@ -545,7 +589,7 @@ export default function ReviewPage() {
 
       {/* 重译确认子菜单：可填额外指示（适用于当前所有勾选的 TU）。 */}
       <Modal
-        title={`重译所选 ${selectedIds.size} 个 TU`}
+        title={`重译所选 ${selectedIds.size} 条`}
         open={retranslateModal}
         onOk={() => void confirmRetranslate()}
         onCancel={() => setRetranslateModal(false)}

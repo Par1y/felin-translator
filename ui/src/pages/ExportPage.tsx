@@ -1,5 +1,13 @@
 import { useState } from "react";
-import { App as AntdApp, Alert, Button, Card, Input, Space, Typography } from "antd";
+import {
+  App as AntdApp,
+  Alert,
+  Button,
+  Card,
+  Input,
+  Space,
+  Typography,
+} from "antd";
 import type { ExportResult, TranslationExport } from "../types";
 import { api } from "../api";
 import { pickDirectory, pickSavePath } from "../dialog";
@@ -15,7 +23,7 @@ export default function ExportPage() {
 
   const doExport = async () => {
     if (!dest.trim()) {
-      message.warning("请输入导出归档的目标路径");
+      message.warning("请输入导出归档的路径");
       return;
     }
     setBusy(true);
@@ -32,14 +40,14 @@ export default function ExportPage() {
 
   const doTxExport = async () => {
     if (!txDir.trim()) {
-      message.warning("请输入译文导出的目标目录");
+      message.warning("请输入导出译文的路径");
       return;
     }
     setTxBusy(true);
     try {
       const r = await api.exportTranslations(txDir.trim());
       setTxResult(r);
-      message.success(`译文导出完成：${r.tus} 个 TU`);
+      message.success(`译文导出完成：${r.tus} 条`);
     } catch (e) {
       message.error(String(e));
     } finally {
@@ -48,7 +56,11 @@ export default function ExportPage() {
   };
 
   return (
-    <Space direction="vertical" size="large" style={{ width: "100%", maxWidth: 800 }}>
+    <Space
+      direction="vertical"
+      size="large"
+      style={{ width: "100%", maxWidth: 800 }}
+    >
       {/* 译文导出：确定性 汉化 .txt + 译文.csv。 */}
       <Card title="译文导出">
         <Space direction="vertical" style={{ width: "100%" }}>
@@ -76,9 +88,15 @@ export default function ExportPage() {
             <Alert
               type="success"
               showIcon
-              message={`导出完成：${txResult.tus} 个 TU`}
+              message={`导出完成：${txResult.tus} 条`}
               description={
-                <div style={{ fontFamily: "monospace", fontSize: 12, wordBreak: "break-all" }}>
+                <div
+                  style={{
+                    fontFamily: "monospace",
+                    fontSize: 12,
+                    wordBreak: "break-all",
+                  }}
+                >
                   <div>汉化：{txResult.txt_path}</div>
                   <div>CSV：{txResult.csv_path}</div>
                 </div>
@@ -124,7 +142,13 @@ export default function ExportPage() {
               showIcon
               message="导出完成"
               description={
-                <div style={{ fontFamily: "monospace", fontSize: 12, wordBreak: "break-all" }}>
+                <div
+                  style={{
+                    fontFamily: "monospace",
+                    fontSize: 12,
+                    wordBreak: "break-all",
+                  }}
+                >
                   <div>文件：{result.archive}</div>
                   <div>
                     大小：{result.bytes} 字节，共 {result.files} 个文件

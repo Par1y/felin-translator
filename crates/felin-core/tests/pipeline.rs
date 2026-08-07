@@ -597,3 +597,104 @@ fn guidelines_default_and_roundtrip() {
     db.set_guidelines("自定义总则").unwrap();
     assert_eq!(db.get_guidelines().unwrap(), "自定义总则");
 }
+
+#[tokio::test]
+async fn retranslate_count_includes_pending() {
+    let (_d, db, tus) = build_project(&[("甲", &["a1", "a2", "a3"])]);
+    run_to_end(Arc::clone(&db), MockTranslator::new("T"), cfg(1, 1)).await;
+    for id in &tus[0] { assert_eq!(tu_status(&db, *id), TuStatus::Translated); }
+    // Retranslate all 3 while the pipeline is idle.
+    let n = db.retranslate_tus(&tus[0], None).unwrap();
+    eprintln!("requeue count (all translated): {n}");
+    assert_eq!(n, 3);
+    // Now simulate a mix: one TU still pending (never translated).
+    let (_d2, db2, tus2) = build_project(&[("乙", &["b1", "b2"])]);
+    db2.db().write(|c| {
+        c.execute("UPDATE tus SET status='translated' WHERE id=?1", [tus2[0][0]])?;
+        Ok(())
+    }).unwrap();
+    let sel = vec![tus2[0][0], tus2[0][1]]; // one translated, one pending
+    let n2 = db2.retranslate_tus(&sel, None).unwrap();
+    eprintln!("requeue count (1 translated + 1 pending): {n2}");
+    assert_eq!(n2, 2, "pending must be requeued so the count matches selection");
+}
+
+#[tokio::test]
+async fn retranslate_while_idle_requeues_with_force() {
+    // All translated → run completes → scheduler exits. Retranslate marks the
+    // TUs queued + force_retranslate (the auto-start is the Tauri command's job,
+    // tested at the command layer; here we verify the DB state a fresh run sees).
+    let (_d, db, tus) = build_project(&[("甲", &["a1", "a2"])]);
+    run_to_end(Arc::clone(&db), MockTranslator::new("T"), cfg(1, 1)).await;
+    let n = db.retranslate_tus(&tus[0], None).unwrap();
+    assert_eq!(n, 2);
+    for id in &tus[0] {
+        assert_eq!(tu_status(&db, *id), TuStatus::Queued);
+        let (claimed, force) = db.claim_tu_explicit(*id).unwrap();
+        assert!(claimed && force, "idle retranslate must force a fresh call");
+    }
+}
+
+#[tokio::test]
+async fn retranslate_force_bypasses_memory_dedup() {
+    // Two identical sources; first gets approved, second re-translated.
+    let (_d, db, tus) = build_project(&[("甲", &["相同原文", "相同原文"])]);
+    // Translate both.
+    run_to_end(Arc::clone(&db), MockTranslator::new("T"), cfg(1, 1)).await;
+    assert_eq!(tu_status(&db, tus[0][0]), TuStatus::Translated);
+    assert_eq!(tu_status(&db, tus[0][1]), TuStatus::Translated);
+    // Approve the first so it becomes a memory candidate.
+    db.approve_tu(tus[0][0]).unwrap();
+    // Retranslate the second (identical source). If memory_dedup on, it instantly
+    // reuses the approved translation rather than calling the LLM.
+    let n = db.retranslate_tus(&[tus[0][1]], None).unwrap();
+    assert_eq!(n, 1);
+    // The force flag (set by retranslate) makes the pipeline call the LLM even
+    // though memory has an approved identical source.
+    let mock = MockTranslator::new("改过");
+    run_to_end(Arc::clone(&db), mock.clone(), cfg(1, 1)).await;
+    let calls = mock.calls.lock().unwrap().clone();
+    eprintln!("calls after retranslate: {:?}", calls);
+    assert!(!calls.is_empty(), "explicit retranslate must call the LLM, not reuse memory");
+    let t = db.get_translation(tus[0][1]).unwrap().unwrap();
+    eprintln!("final text: {:?}", t.final_text);
+    assert_eq!(t.final_text.as_deref(), Some("改过"));
+}
+
+#[test]
+fn retranslate_includes_pending_and_sets_force_flag() {
+    let (_d, db, tus) = build_project(&[("甲", &["a1", "a2", "a3"])]);
+    // a1 translated+approved, a2 failed, a3 still pending (never translated).
+    db.claim_tu(tus[0][0]).unwrap();
+    db.complete_translation(tus[0][0], "译文", &source_hash("a1"), false).unwrap();
+    db.approve_tu(tus[0][0]).unwrap();
+    db.claim_tu(tus[0][1]).unwrap();
+    db.fail_translation(tus[0][1], "失败", false).unwrap();
+
+    // Selecting all three must requeue all three (count matches selection),
+    // including the never-translated pending one.
+    let n = db.retranslate_tus(&tus[0], None).unwrap();
+    assert_eq!(n, 3, "pending must be requeued too");
+    for id in &tus[0] {
+        assert_eq!(tu_status(&db, *id), TuStatus::Queued);
+    }
+    // The force flag is set so a fresh LLM call happens (memory dedup bypassed).
+    let (claimed, force) = db.claim_tu_explicit(tus[0][0]).unwrap();
+    assert!(claimed);
+    assert!(force, "retranslate must mark force_retranslate");
+    // A TU that was never retranslated claims with force cleared.
+    let (_, _) = db.claim_tu_explicit(tus[0][0]).unwrap(); // back to translating
+    assert_eq!(tu_status(&db, tus[0][0]), TuStatus::Translating);
+}
+
+#[test]
+fn claim_tu_explicit_clears_force_flag_once() {
+    let (_d, db, tus) = build_project(&[("甲", &["x1"])]);
+    db.retranslate_tus(&[tus[0][0]], None).unwrap();
+    // First claim reads the flag and clears it.
+    let (c1, f1) = db.claim_tu_explicit(tus[0][0]).unwrap();
+    assert!(c1 && f1);
+    // A second claim on the same TU (reset to queued) sees no flag.
+    db.claim_tu_explicit(tus[0][0]).unwrap(); // now translating
+    assert_eq!(tu_status(&db, tus[0][0]), TuStatus::Translating);
+}

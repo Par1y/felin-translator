@@ -220,6 +220,49 @@ fn old_v5_project_db_gains_extracted_tags_column() {
 }
 
 #[test]
+fn old_v6_project_db_gains_force_retranslate_column() {
+    // Tolerance for an old project.db predating `tus.force_retranslate` (schema
+    // v6). Reopening with the full migration set must run v7 — add the column
+    // with a 0 default — preserving existing TUs and never erroring.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("project.db");
+
+    {
+        let db = Db::open(
+            &path,
+            &felin_core::storage::PROJECT_MIGRATIONS[..6],
+            true,
+            DbTuning::default(),
+        )
+        .unwrap();
+        db.write(|c| {
+            c.execute(
+                "INSERT INTO chapters (title, ord, status) VALUES ('甲', 0, 'done')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO tus (chapter_id, paragraph_ids, ord, status)
+                 VALUES (1, '[]', 0, 'translated')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let p = ProjectDb::open(&path).unwrap();
+    let ch = p.get_or_create_chapter("甲").unwrap();
+    let tus = p.list_tus(ch).unwrap();
+    assert_eq!(tus.len(), 1);
+    let tu_id = tus[0].id;
+    // Retranslate (moves translated → queued, sets force), then claim clears it.
+    assert!(p.retranslate_tu(tu_id, "").unwrap());
+    let (claimed, force) = p.claim_tu_explicit(tu_id).unwrap();
+    assert!(claimed);
+    assert!(force, "retranslate on a migrated v6 row must set force_retranslate");
+}
+
+#[test]
 fn project_lock_is_exclusive_and_released_on_drop() {
     let dir = tempfile::tempdir().unwrap();
     let first = ProjectLock::acquire(dir.path()).unwrap();
