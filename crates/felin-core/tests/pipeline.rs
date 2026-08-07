@@ -129,11 +129,10 @@ fn cfg(workers: usize, window: usize) -> RunConfig {
     }
 }
 
-/// Seed an enabled entry in the project small glossary (japanese + aliases feed
-/// the prompt-injection matcher).
-fn add_entry(db: &ProjectDb, japanese: &str, chinese: &str, aliases: &[&str]) -> i64 {
-    let aliases: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
-    db.insert_glossary_entry(None, japanese, Some(chinese), None, None, &[], &aliases, None)
+/// Seed an enabled entry in the project small glossary (japanese feeds the
+/// prompt-injection matcher).
+fn add_entry(db: &ProjectDb, japanese: &str, chinese: &str) -> i64 {
+    db.insert_glossary_entry(None, japanese, Some(chinese), None, None, &[], None)
         .unwrap()
 }
 
@@ -467,10 +466,10 @@ async fn requeue_failed_scopes_tu_chapter_all() {
 #[tokio::test]
 async fn prompt_injects_glossary_and_context() {
     // Enabled project small-glossary entries feed the prompt matcher; the
-    // japanese form and every alias should both hit. A disabled entry must not.
-    let (_d, db, tus) = build_project(&[("甲", &["前段原文", "田中来了", "たなか来了"])]);
-    add_entry(&db, "田中", "田中", &["たなか"]);
-    let disabled_id = add_entry(&db, "禁用词", "禁用", &[]);
+    // japanese form should hit. A disabled entry must not.
+    let (_d, db, tus) = build_project(&[("甲", &["前段原文", "田中来了", "田中さん来了"])]);
+    add_entry(&db, "田中", "田中");
+    let disabled_id = add_entry(&db, "禁用词", "禁用");
     db.set_entry_enabled(disabled_id, false).unwrap();
 
     // Approve the first TU so it becomes context for the others.
@@ -492,10 +491,37 @@ async fn prompt_injects_glossary_and_context() {
     assert!(req.context.as_deref().unwrap_or("").contains("前段译文"));
     assert!(req.glossary.as_deref().unwrap_or("").contains("田中 → 田中"));
     assert!(req.guidelines.contains("日译中"));
-    // The alias form matches too; the disabled entry is never injected.
-    let alias_req = &reqs[1];
-    assert!(alias_req.glossary.as_deref().unwrap_or("").contains("田中 → 田中"));
-    assert!(!alias_req.glossary.as_deref().unwrap_or("").contains("禁用"));
+    // Both remaining sources hit the canonical 田中; the disabled entry is never injected.
+    let req2 = &reqs[1];
+    assert!(req2.glossary.as_deref().unwrap_or("").contains("田中 → 田中"));
+    assert!(!req2.glossary.as_deref().unwrap_or("").contains("禁用"));
+}
+
+#[test]
+fn list_tus_matched_names_surfaces_only_enabled_glossary() {
+    // The review query surfaces exactly what prompt injection applied: the TU's
+    // effective source vs the *enabled* small-glossary entries, de-duplicated by
+    // entry id in first-occurrence order. A disabled entry never matches.
+    let (_d, db, tus) = build_project(&[("甲", &["田中见了田中，还有佐藤"])]);
+    add_entry(&db, "田中", "田中");
+    let disabled_id = add_entry(&db, "佐藤", "佐藤");
+    db.set_entry_enabled(disabled_id, false).unwrap();
+
+    let cid = db.list_chapters().unwrap()[0].id;
+    let listed = db.list_tus_with_translations(cid).unwrap();
+    assert_eq!(listed.len(), 1);
+    let names = &listed[0].matched_names;
+    assert_eq!(names.len(), 1, "the repeated 田中 dedups; the disabled 佐藤 is excluded");
+    assert_eq!(
+        names[0],
+        felin_core::types::MatchedName { japanese: "田中".into(), chinese: Some("田中".into()) },
+    );
+    assert_eq!(names[0].chinese.as_deref(), Some("田中"));
+
+    // A source override re-runs the match against the new effective source.
+    db.set_tu_source(tus[0][0], "佐藤来了").unwrap();
+    let listed = db.list_tus_with_translations(cid).unwrap();
+    assert!(listed[0].matched_names.is_empty(), "no enabled entry in the override");
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ use std::path::Path;
 pub const GLOBAL_MIGRATIONS: &[Migration] = &[
     Migration { version: 1, sql: include_str!("migrations/global/0001_init.sql") },
     Migration { version: 2, sql: include_str!("migrations/global/0002_tags_enabled.sql") },
+    Migration { version: 3, sql: include_str!("migrations/global/0003_remove_aliases.sql") },
 ];
 
 /// Typed wrapper over the global glossary database.
@@ -119,18 +120,6 @@ impl GlobalDb {
         })
     }
 
-    /// Add an alias form for a name (idempotent on `japanese_form`).
-    pub fn add_alias(&self, name_id: i64, japanese_form: &str) -> Result<()> {
-        self.db.write(|c| {
-            c.execute(
-                "INSERT INTO name_aliases (name_id, japanese_form) VALUES (?1, ?2)
-                 ON CONFLICT(japanese_form) DO NOTHING",
-                rusqlite::params![name_id, japanese_form],
-            )?;
-            Ok(())
-        })
-    }
-
     /// Record a field change in `name_history`.
     pub fn record_history(&self, name_id: i64, field: &str, old: Option<&str>, new: Option<&str>) -> Result<()> {
         let now = now_iso8601();
@@ -195,20 +184,13 @@ impl GlobalDb {
         })
     }
 
-    /// All japanese forms (canonical + aliases) paired with their name id, for
-    /// building a [`crate::names::Matcher`].
+    /// All canonical japanese forms paired with their name id, for building a
+    /// [`crate::names::Matcher`].
     pub fn glossary_forms(&self) -> Result<Vec<(String, i64)>> {
         self.db.read(|c| {
-            let mut out = Vec::new();
-            let mut a = c.prepare("SELECT japanese, id FROM names")?;
-            for row in a.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
-                out.push(row?);
-            }
-            let mut b = c.prepare("SELECT japanese_form, name_id FROM name_aliases")?;
-            for row in b.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
-                out.push(row?);
-            }
-            Ok(out)
+            let mut stmt = c.prepare("SELECT japanese, id FROM names")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
         })
     }
 
@@ -226,15 +208,19 @@ impl GlobalDb {
         })
     }
 
-    /// The alias forms of one entry (canonical japanese excluded), for copying
-    /// into a project's self-contained small glossary.
-    pub fn aliases_for(&self, name_id: i64) -> Result<Vec<String>> {
-        self.db.read(|c| {
-            let mut stmt = c.prepare(
-                "SELECT japanese_form FROM name_aliases WHERE name_id = ?1 ORDER BY japanese_form",
-            )?;
-            let rows = stmt.query_map([name_id], |r| r.get(0))?;
-            rows.collect::<rusqlite::Result<Vec<String>>>().map_err(Into::into)
+    /// Batch-delete global entries by id (`name_history` rows cascade via FK;
+    /// `name_aliases` was dropped in migration v3). Returns the number actually
+    /// deleted. Project small-glossary `name_global_id` pointers are *not* touch
+    /// here — callers clear those separately (see
+    /// [`ProjectDb::clear_global_provenance`]).
+    pub fn delete_names(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.db.write(|c| {
+            let ph = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM names WHERE id IN ({ph})");
+            Ok(c.execute(&sql, rusqlite::params_from_iter(ids.iter()))?)
         })
     }
 }

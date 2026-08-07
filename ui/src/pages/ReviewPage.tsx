@@ -9,6 +9,7 @@ import {
   InputNumber,
   List,
   Modal,
+  Popconfirm,
   Select,
   Space,
   Tabs,
@@ -53,12 +54,16 @@ const STATUS_GROUPS: Record<string, string[]> = {
 function TuCard({
   tu,
   selected,
+  deleteSelected,
   onToggleRetranslate,
+  onToggleDelete,
   onChanged,
 }: {
   tu: TuWithTranslation;
   selected: boolean;
+  deleteSelected: boolean;
   onToggleRetranslate: (id: number, checked: boolean) => void;
+  onToggleDelete: (id: number, checked: boolean) => void;
   onChanged: () => void;
 }) {
   const { message } = AntdApp.useApp();
@@ -110,6 +115,13 @@ function TuCard({
 
   const status = tuStatusView(tu.status);
 
+  /// The enabled small-glossary entries this TU's source hit — what prompt
+  /// injection applied — rendered as 专名 tags under the 原文.
+  const matchedText =
+    (tu.matched_names ?? [])
+      .map((m) => (m.chinese && m.chinese.trim() ? `${m.japanese} → ${m.chinese}` : m.japanese))
+      .join(" / ") || "—";
+
   return (
     <Card
       size="small"
@@ -125,6 +137,12 @@ function TuCard({
             onChange={(e) => onToggleRetranslate(tu.id, e.target.checked)}
           >
             重译
+          </Checkbox>
+          <Checkbox
+            checked={deleteSelected}
+            onChange={(e) => onToggleDelete(tu.id, e.target.checked)}
+          >
+            删除
           </Checkbox>
         </Space>
       }
@@ -149,6 +167,9 @@ function TuCard({
             onBlur={commitSource}
             autoSize={{ minRows: 2, maxRows: 8 }}
           />
+          <Typography.Text type="secondary" style={{ display: "block", marginTop: 4, fontSize: 12 }}>
+            专名：{matchedText}
+          </Typography.Text>
         </div>
         <div>
           <Typography.Text type="secondary" style={{ display: "block", marginBottom: 4 }}>
@@ -190,6 +211,7 @@ export default function ReviewPage() {
   const [activeChapters, setActiveChapters] = useState<number[]>([]);
   const [tuRows, setTuRows] = useState<TuWithTranslation[]>([]);
   const [retranslateIds, setRetranslateIds] = useState<Set<number>>(new Set());
+  const [deleteIds, setDeleteIds] = useState<Set<number>>(new Set());
   const [retranslateModal, setRetranslateModal] = useState(false);
   const [retranslateInstr, setRetranslateInstr] = useState("");
   const taskRef = useRef<string | null>(null);
@@ -229,6 +251,7 @@ export default function ReviewPage() {
   }, []);
 
   useEffect(() => {
+    setDeleteIds(new Set());
     if (chapterId == null) {
       setTuRows([]);
       return;
@@ -364,9 +387,34 @@ export default function ReviewPage() {
     }
   };
 
+  const toggleDelete = (id: number, checked: boolean) => {
+    setDeleteIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const confirmDelete = async () => {
+    const ids = [...deleteIds];
+    if (ids.length === 0) return;
+    try {
+      const n = await api.deleteTus(ids);
+      message.success(`已删除 ${n} 个 TU（连同其段落）`);
+      setDeleteIds(new Set());
+      void refreshTranslation();
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
   const groupStates = STATUS_GROUPS[group] ?? [];
   const shown = groupStates.length === 0 ? tuRows : tuRows.filter((t) => groupStates.includes(t.status));
   const totalCount = counts.reduce((a, c) => a + c.count, 0);
+  // Batch-delete selection state against the currently-shown TU cards.
+  const selectedShown = shown.filter((t) => deleteIds.has(t.id)).length;
+  const allShownSelected = shown.length > 0 && selectedShown === shown.length;
 
   return (
     <Space direction="vertical" size="large" style={{ width: "100%", maxWidth: 900 }}>
@@ -451,6 +499,30 @@ export default function ReviewPage() {
       </Card>
 
       {/* ③ 可编辑 TU 卡片：每「原文-译文」一张卡片。 */}
+      <Space wrap style={{ marginBottom: 8 }}>
+        <Checkbox
+          checked={allShownSelected}
+          indeterminate={selectedShown > 0 && !allShownSelected}
+          onChange={(e) =>
+            setDeleteIds(e.target.checked ? new Set(shown.map((t) => t.id)) : new Set())
+          }
+        >
+          全选
+        </Checkbox>
+        <Popconfirm
+          title={`删除所选 ${deleteIds.size} 个段落？`}
+          description="将连同其原文段落一并删除，不可撤销。"
+          okText="删除"
+          cancelText="取消"
+          okButtonProps={{ danger: true }}
+          onConfirm={() => void confirmDelete()}
+          disabled={deleteIds.size === 0}
+        >
+          <Button danger disabled={deleteIds.size === 0}>
+            删除所选（{deleteIds.size}）
+          </Button>
+        </Popconfirm>
+      </Space>
       {shown.length === 0 ? (
         <Empty description="本章暂无 TU（请先自动分段，或切换筛选）" />
       ) : (
@@ -462,7 +534,9 @@ export default function ReviewPage() {
               <TuCard
                 tu={tu}
                 selected={retranslateIds.has(tu.id)}
+                deleteSelected={deleteIds.has(tu.id)}
                 onToggleRetranslate={toggleRetranslate}
+                onToggleDelete={toggleDelete}
                 onChanged={() => void refreshTranslation()}
               />
             </List.Item>

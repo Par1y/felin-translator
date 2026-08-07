@@ -1,5 +1,6 @@
 //! Application state shared across Tauri commands.
 
+use felin_core::config::PromptConfig;
 use felin_core::storage::{GlobalDb, ProjectDb, ProjectLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,6 +39,11 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Technical parameters loaded from `<data_dir>/felin.toml`.
     pub config: felin_core::config::TechConfig,
+    /// The runtime-effective `[prompt]` templates (from `felin.toml`). Seeded
+    /// from `config.prompt` at startup; `set_prompt_config` updates it in place
+    /// so edits take effect without a restart (translation / name extraction
+    /// read this, not `config.prompt`).
+    pub prompt: Mutex<PromptConfig>,
     /// The shared glossary DB, opened at startup.
     pub global: GlobalDb,
     /// OCR sidecar binary (`ocr-cli`) resolved from *user-managed* sources:
@@ -67,6 +73,11 @@ impl AppState {
     /// permanently brick the app (mirrors the DB layer's policy).
     pub fn project_guard(&self) -> MutexGuard<'_, Option<OpenProject>> {
         self.project.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Lock the runtime-effective prompt templates, recovering from poisoning.
+    pub fn prompt_config(&self) -> MutexGuard<'_, PromptConfig> {
+        self.prompt.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Lock the task registry, recovering from poisoning.

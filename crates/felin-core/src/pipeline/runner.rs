@@ -7,11 +7,8 @@
 
 use super::{source_hash, PipelineEvent, RunConfig, Translator};
 use crate::error::{Error, Result};
-use crate::names::Matcher;
-use crate::pipeline::prompt::{build_tu_request, glossary_block};
+use crate::pipeline::prompt::{build_tu_request, glossary_block, GlossaryMatcher};
 use crate::storage::ProjectDb;
-use crate::types::GlossaryEntry;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Notify};
 
@@ -23,34 +20,6 @@ enum Outcome {
     Aborted,
     /// The TU left `translating` while we worked (user took over): discard.
     Discarded,
-}
-
-/// Compiled glossary data for prompt injection. Built from the *project's small
-/// glossary* (enabled entries only): the canonical japanese form plus every
-/// alias feed the matcher; the lookup maps the entry id to the canonical form
-/// and its Chinese rendering for the injected block.
-struct GlossaryData {
-    matcher: Matcher,
-    lookup: HashMap<i64, (String, Option<String>)>,
-}
-
-fn build_glossary(entries: &[GlossaryEntry]) -> Result<Option<GlossaryData>> {
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    let mut forms: Vec<(String, i64)> = Vec::new();
-    let mut lookup: HashMap<i64, (String, Option<String>)> = HashMap::new();
-    for e in entries {
-        forms.push((e.japanese.clone(), e.id));
-        for a in &e.aliases {
-            if !a.trim().is_empty() {
-                forms.push((a.clone(), e.id));
-            }
-        }
-        lookup.insert(e.id, (e.japanese.clone(), e.chinese.clone()));
-    }
-    let matcher = Matcher::build(&forms)?;
-    Ok(Some(GlossaryData { matcher, lookup }))
 }
 
 /// Run the pipeline to completion or stop. Crash recovery happens first: stale
@@ -69,11 +38,12 @@ pub async fn run<T: Translator + 'static>(
     db.requeue_interrupted()?;
 
     let guidelines = db.get_guidelines()?;
-    let glossary = Arc::new(build_glossary(&db.matcher_entries()?)?);
+    let glossary = Arc::new(GlossaryMatcher::build(&db.matcher_entries()?)?);
 
     let workers = cfg.workers.max(1);
     let queue = cfg.queue_capacity.max(workers);
     let cfg = RunConfig { queue_capacity: queue, ..cfg };
+    tracing::debug!(workers, queue, "translation pipeline run started");
 
     let (feed_tx, feed_rx) = mpsc::channel::<i64>(queue);
     let (free_tx, free_rx) = mpsc::channel::<()>(workers);
@@ -121,6 +91,7 @@ async fn scheduler(
     wake: Arc<Notify>,
 ) {
     let total = db.count_tus().unwrap_or(0) as usize;
+    tracing::debug!(total_tus = total, "translation pipeline total TUs");
     let _ = events.send(PipelineEvent::Started { total_tus: total });
 
     let mut outstanding = 0usize;
@@ -128,6 +99,7 @@ async fn scheduler(
 
     loop {
         if outstanding == 0 && !has_any_eligible(&db, &cfg).unwrap_or(false) {
+            tracing::debug!(total_tus = total, "translation pipeline finished");
             let _ = events.send(PipelineEvent::Finished { total_tus: total });
             // `feed` drops as we return, closing the workers' channel.
             return;
@@ -147,6 +119,7 @@ async fn scheduler(
     }
 
     drop(feed);
+    tracing::debug!(total_tus = total, "translation pipeline stopped");
     let _ = events.send(PipelineEvent::Stopped);
 }
 
@@ -186,7 +159,7 @@ async fn worker_loop<T: Translator + 'static>(
     translator: Arc<T>,
     cfg: RunConfig,
     guidelines: String,
-    glossary: Arc<Option<GlossaryData>>,
+    glossary: Arc<Option<GlossaryMatcher>>,
     feed: Arc<tokio::sync::Mutex<mpsc::Receiver<i64>>>,
     free_tx: mpsc::Sender<()>,
     events: mpsc::UnboundedSender<PipelineEvent>,
@@ -217,7 +190,7 @@ async fn process_one<T: Translator + 'static>(
     translator: &T,
     cfg: &RunConfig,
     guidelines: &str,
-    glossary: &Option<GlossaryData>,
+    glossary: &Option<GlossaryMatcher>,
     events: &mpsc::UnboundedSender<PipelineEvent>,
     stop: &mut watch::Receiver<bool>,
     tu_id: i64,
@@ -238,9 +211,11 @@ async fn process_one<T: Translator + 'static>(
     };
     match outcome {
         Outcome::Done { memory_hit } => {
+            tracing::debug!(tu_id, memory_hit, "TU translated");
             let _ = events.send(PipelineEvent::TuDone { tu_id, memory_hit });
         }
         Outcome::Failed { error } => {
+            tracing::debug!(tu_id, error = %error, "TU failed");
             let _ = events.send(PipelineEvent::TuFailed { tu_id, error });
         }
         Outcome::Aborted | Outcome::Discarded => {}
@@ -255,7 +230,7 @@ async fn run_one<T: Translator + 'static>(
     translator: &T,
     cfg: &RunConfig,
     guidelines: &str,
-    glossary: &Option<GlossaryData>,
+    glossary: &Option<GlossaryMatcher>,
     stop: &mut watch::Receiver<bool>,
     tu_id: i64,
 ) -> Result<Outcome> {

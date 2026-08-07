@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { App as AntdApp, Button, Card, Empty, Input, List, Space, Tag, Typography } from "antd";
+import { App as AntdApp, Button, Card, Empty, Input, List, Modal, Popconfirm, Space, Tag, Typography } from "antd";
 import type { ProjectSummary } from "../types";
 import { api } from "../api";
 
@@ -16,6 +16,8 @@ export default function ProjectsPage({
   const [loading, setLoading] = useState(false);
   const [importPath, setImportPath] = useState("");
   const [importing, setImporting] = useState(false);
+  const [renaming, setRenaming] = useState<ProjectSummary | null>(null);
+  const [renameValue, setRenameValue] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -63,6 +65,46 @@ export default function ProjectsPage({
       await api.closeProject();
       await onChange();
       message.success("已关闭项目");
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
+  const openRename = (p: ProjectSummary) => {
+    setRenameValue(p.name);
+    setRenaming(p);
+  };
+
+  const confirmRename = async () => {
+    if (!renaming) return;
+    const next = renameValue.trim();
+    if (!next) {
+      message.warning("项目名称不能为空");
+      return;
+    }
+    try {
+      await api.renameProject(renaming.slug, next);
+      setRenaming(null);
+      // The open project's display name changed → sync the main title (App
+      // re-pulls current_project via onChange).
+      await onChange();
+      await refresh();
+      message.success("已重命名项目");
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
+  const remove = async (slug: string) => {
+    try {
+      await api.deleteProject(slug);
+      // Deleting the open project closes it in the backend → App returns to the
+      // un-opened state.
+      if (project?.slug === slug) {
+        await onChange();
+      }
+      await refresh();
+      message.success("项目已删除");
     } catch (e) {
       message.error(String(e));
     }
@@ -119,6 +161,22 @@ export default function ProjectsPage({
                   >
                     {project?.slug === p.slug ? "已打开" : "打开"}
                   </Button>,
+                  <Button key="rename" type="link" onClick={() => openRename(p)}>
+                    重命名
+                  </Button>,
+                  <Popconfirm
+                    key="delete"
+                    title={`删除项目「${p.name}」？`}
+                    description="将删除其全部数据，此操作不可撤销，归档不会被删除。"
+                    okText="删除"
+                    cancelText="取消"
+                    okButtonProps={{ danger: true }}
+                    onConfirm={() => remove(p.slug)}
+                  >
+                    <Button type="link" danger>
+                      删除
+                    </Button>
+                  </Popconfirm>,
                 ]}
               >
                 <List.Item.Meta
@@ -154,6 +212,24 @@ export default function ProjectsPage({
           </Button>
         </Space.Compact>
       </Card>
+
+      {/* Rename a project's display name (disk dir / slug unchanged). */}
+      <Modal
+        title="重命名项目"
+        open={renaming !== null}
+        onOk={confirmRename}
+        onCancel={() => setRenaming(null)}
+        okText="保存"
+        cancelText="取消"
+      >
+        <Input
+          value={renameValue}
+          onChange={(e) => setRenameValue(e.target.value)}
+          onPressEnter={confirmRename}
+          placeholder="项目显示名称"
+          autoFocus
+        />
+      </Modal>
     </Space>
   );
 }

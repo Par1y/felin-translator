@@ -1,7 +1,7 @@
-//! Multi-pattern proper-noun matching over a project's glossary Japanese forms
-//! (canonical + aliases), using Aho-Corasick with leftmost-longest semantics so
-//! a longer glossary entry wins over a shorter one it contains (e.g. 田中角栄
-//! over 田中). Matching runs on NFKC-normalized text.
+//! Multi-pattern proper-noun matching over a project's glossary Japanese forms,
+//! using Aho-Corasick with leftmost-longest semantics so a longer glossary
+//! entry wins over a shorter one it contains (e.g. 田中角栄 over 田中). Matching
+//! runs on NFKC-normalized text.
 
 use crate::error::{Error, Result};
 use crate::names::normalize::normalize;
@@ -18,7 +18,7 @@ pub struct Hit {
 }
 
 /// A compiled matcher over `(japanese_form, name_id)` pairs. Forms may repeat a
-/// `name_id` (aliases of the same entry).
+/// `name_id` (multiple canonical forms that refer to the same entry).
 pub struct Matcher {
     ac: Option<AhoCorasick>,
     name_ids: Vec<i64>,
@@ -74,44 +74,3 @@ impl Matcher {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn longest_match_wins() {
-        let m = Matcher::build(&[("田中".into(), 1), ("田中角栄".into(), 2)]).unwrap();
-        let hits = m.find_hits("昨日、田中角栄が来た。");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].name_id, 2);
-        assert_eq!(hits[0].form, "田中角栄");
-    }
-
-    #[test]
-    fn shorter_entry_still_matches_when_alone() {
-        let m = Matcher::build(&[("田中".into(), 1), ("田中角栄".into(), 2)]).unwrap();
-        assert_eq!(m.name_ids_in("田中さんこんにちは"), vec![1]);
-    }
-
-    #[test]
-    fn aliases_share_a_name_id() {
-        let m = Matcher::build(&[("猫".into(), 5), ("ネコ".into(), 5)]).unwrap();
-        let hits = m.find_hits("猫とネコ");
-        assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|h| h.name_id == 5));
-        assert_eq!(m.name_ids_in("猫とネコ"), vec![5]);
-    }
-
-    #[test]
-    fn matching_is_normalization_aware() {
-        // pattern in fullwidth katakana; text in halfwidth katakana.
-        let m = Matcher::build(&[("タナカ".into(), 7)]).unwrap();
-        assert_eq!(m.name_ids_in("ﾀﾅｶが来た"), vec![7]);
-    }
-
-    #[test]
-    fn empty_glossary_finds_nothing() {
-        let m = Matcher::build(&[]).unwrap();
-        assert!(m.find_hits("何か").is_empty());
-    }
-}

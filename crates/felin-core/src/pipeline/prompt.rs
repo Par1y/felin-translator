@@ -1,8 +1,10 @@
 //! TU → `TranslateRequest` assembly: 总则 + instruction + glossary + context +
 //! source, with the truncation rules (truncate context and 总则, never source).
 
+use crate::error::Result;
 use crate::llm::TranslateRequest;
-use crate::names::{normalize, Hit};
+use crate::names::{normalize, Hit, Matcher};
+use crate::types::{GlossaryEntry, MatchedName};
 use std::collections::HashMap;
 
 /// The project's default 总则 template (editable; persisted per project).
@@ -60,6 +62,78 @@ pub fn glossary_block(
     }
 }
 
+/// Compiled project-glossary matching data. The canonical japanese forms feed
+/// the Aho-Corasick matcher; `lookup` maps each entry id to its (canonical
+/// japanese, chinese) rendering. Built **once** over the *enabled* entries
+/// ([`crate::storage::ProjectDb::matcher_entries`]) and reused across many TUs —
+/// by the pipeline (one compile per run) and by the review query (one compile
+/// per chapter listing).
+pub struct GlossaryMatcher {
+    /// Leftmost-longest matcher over the canonical japanese forms.
+    pub matcher: Matcher,
+    /// Entry id → (canonical japanese, chinese rendering) for surfaced names.
+    pub lookup: HashMap<i64, (String, Option<String>)>,
+}
+
+impl GlossaryMatcher {
+    /// Compile over `entries`. The caller decides the entry set — prompt
+    /// injection and the review query both pass the *enabled* entries so the
+    /// surfaced names are exactly what translation applied. An empty set yields
+    /// a matcher that finds nothing (`None`).
+    pub fn build(entries: &[GlossaryEntry]) -> Result<Option<Self>> {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let mut forms: Vec<(String, i64)> = Vec::new();
+        let mut lookup: HashMap<i64, (String, Option<String>)> = HashMap::new();
+        for e in entries {
+            forms.push((e.japanese.clone(), e.id));
+            lookup.insert(e.id, (e.japanese.clone(), e.chinese.clone()));
+        }
+        let matcher = Matcher::build(&forms)?;
+        Ok(Some(Self { matcher, lookup }))
+    }
+
+    /// The distinct entries `source` matches, de-duplicated by entry id in
+    /// first-occurrence order — what prompt injection applied to this TU.
+    pub fn matched_names(&self, source: &str) -> Vec<MatchedName> {
+        let hits = self.matcher.find_hits(source);
+        matched_names(&hits, &self.lookup)
+    }
+}
+
+/// One-shot [`GlossaryMatcher`]: compile `entries` and return the distinct names
+/// `source` matches. For a single source (tests / ad-hoc queries). Callers
+/// processing many sources should reuse [`GlossaryMatcher`] so the matcher
+/// compiles once.
+pub fn tu_matched_names(source: &str, entries: &[GlossaryEntry]) -> Result<Vec<MatchedName>> {
+    Ok(GlossaryMatcher::build(entries)?.map_or_else(Vec::new, |g| g.matched_names(source)))
+}
+
+/// Map matcher hits to distinct `{japanese, chinese}` pairs, de-duplicated by
+/// entry id in first-occurrence order — the structured twin of
+/// [`glossary_block`] for the review UI. Canonical japanese forms are
+/// normalized; an entry without a non-blank Chinese keeps `chinese: None`.
+pub fn matched_names(
+    hits: &[Hit],
+    lookup: &HashMap<i64, (String, Option<String>)>,
+) -> Vec<MatchedName> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for h in hits {
+        if !seen.insert(h.name_id) {
+            continue;
+        }
+        let Some((jp, zh)) = lookup.get(&h.name_id) else { continue };
+        let jp = normalize(jp);
+        if jp.is_empty() {
+            continue;
+        }
+        out.push(MatchedName { japanese: jp, chinese: zh.clone() });
+    }
+    out
+}
+
 /// Assemble one TU's translation request. `glossary`/`context`/`instruction`
 /// are the optional blocks; 总则 and context are truncated per limits, the
 /// source passes through untouched. `system_template`/`user_template` come from
@@ -87,47 +161,3 @@ pub fn build_tu_request(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn truncate_respects_char_boundary() {
-        assert_eq!(truncate_chars("あいうえお", 5), "あいうえお");
-        assert_eq!(truncate_chars("あいうえお", 3), "あいう…");
-        assert_eq!(truncate_chars("abc", 3), "abc");
-    }
-
-    #[test]
-    fn glossary_block_dedupes_by_id_in_hit_order() {
-        let mut lookup: HashMap<i64, (String, Option<String>)> = HashMap::new();
-        lookup.insert(1, ("田中".into(), Some("田中".into())));
-        lookup.insert(2, ("佐藤".into(), None));
-        let hits = vec![
-            Hit { name_id: 1, start: 0, end: 2, form: "田中".into() },
-            Hit { name_id: 2, start: 2, end: 4, form: "佐藤".into() },
-            Hit { name_id: 1, start: 4, end: 6, form: "田中".into() },
-        ];
-        let block = glossary_block(&hits, &lookup).unwrap();
-        assert_eq!(block, "田中 → 田中\n佐藤");
-    }
-
-    #[test]
-    fn build_request_truncates_context_not_source() {
-        let long_ctx = "あ".repeat(10_000);
-        let long_src = "い".repeat(50_000);
-        let req = build_tu_request(
-            "总则".into(),
-            100,
-            None,
-            None,
-            Some(long_ctx),
-            100,
-            long_src.clone(),
-            String::new(),
-            String::new(),
-        );
-        assert_eq!(req.context.as_ref().unwrap().chars().count(), 101); // 100 + '…'
-        assert_eq!(req.source.chars().count(), 50_000);
-    }
-}

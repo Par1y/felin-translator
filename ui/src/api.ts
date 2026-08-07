@@ -5,6 +5,7 @@ import type {
   AppInfo,
   Chapter,
   CsvMapping,
+  CsvPreviewRow,
   ErrorPayload,
   ExportResult,
   ExtractedName,
@@ -20,6 +21,7 @@ import type {
   Paragraph,
   ProgressPayload,
   ProjectSummary,
+  PromptConfig,
   SegmentResult,
   TranslationDonePayload,
   TranslationExport,
@@ -36,6 +38,9 @@ import type {
 export const api = {
   appInfo: () => invoke<AppInfo>("app_info"),
   createProject: (name: string) => invoke<ProjectSummary>("create_project", { name }),
+  renameProject: (slug: string, name: string) =>
+    invoke<ProjectSummary>("rename_project", { slug, name }),
+  deleteProject: (slug: string) => invoke<void>("delete_project", { slug }),
   openProject: (slug: string) => invoke<ProjectSummary>("open_project", { slug }),
   closeProject: () => invoke<void>("close_project"),
   currentProject: () => invoke<ProjectSummary | null>("current_project"),
@@ -61,6 +66,8 @@ export const api = {
     invoke<void>("set_llm_config", { endpoint: endpoint ?? null, model: model ?? null, apiKey: apiKey ?? null }),
   testLlmConnection: () => invoke<void>("test_llm_connection"),
   csvHeaders: (path: string) => invoke<string[]>("csv_headers", { path }),
+  csvPreview: (path: string, mapping: CsvMapping, limit?: number) =>
+    invoke<CsvPreviewRow[]>("csv_preview", { path, mapping, limit: limit ?? null }),
   importGlossaryCsv: (path: string, mapping: CsvMapping, target: "project" | "global") =>
     invoke<number>("import_glossary_csv", { path, mapping, target }),
   listGlossary: (q?: string, limit?: number) =>
@@ -69,12 +76,16 @@ export const api = {
     invoke<void>("set_global_name_tags", { id, tags }),
   setGlobalNameEnabled: (id: number, enabled: boolean) =>
     invoke<void>("set_global_name_enabled", { id, enabled }),
+  deleteGlobalNames: (ids: number[]) => invoke<number>("delete_global_names", { ids }),
   runNameExtraction: () => invoke<number>("run_name_extraction"),
   listExtracted: (status?: string) => invoke<ExtractedName[]>("list_extracted", { status: status ?? null }),
   updateExtracted: (id: number, chinese: string) => invoke<void>("update_extracted", { id, chinese }),
   rejectExtracted: (id: number) => invoke<void>("reject_extracted", { id }),
+  rejectExtractedBatch: (ids: number[]) => invoke<number>("reject_extracted_batch", { ids }),
   confirmExtracted: (id: number, target: "project" | "global") =>
     invoke<void>("confirm_extracted", { id, target }),
+  confirmExtractedBatch: (ids: number[], target: "project" | "global") =>
+    invoke<number>("confirm_extracted_batch", { ids, target }),
 
   startTranslation: () => invoke<string>("start_translation"),
   stopTranslation: () => invoke<void>("stop_translation"),
@@ -93,11 +104,14 @@ export const api = {
     invoke<void>("set_translation_settings", { settings: s }),
   getGuidelines: () => invoke<string>("get_guidelines"),
   setGuidelines: (text: string) => invoke<void>("set_guidelines", { text }),
+  getPromptConfig: () => invoke<PromptConfig>("get_prompt_config"),
+  setPromptConfig: (config: PromptConfig) => invoke<void>("set_prompt_config", { config }),
   listTusWithTranslations: (chapterId: number) =>
     invoke<TuWithTranslation[]>("list_tus_with_translations", { chapterId }),
   setTuSource: (tuId: number, source: string) => invoke<void>("set_tu_source", { tuId, source }),
   setTranslationText: (tuId: number, text: string) =>
     invoke<boolean>("set_translation_text", { tuId, text }),
+  deleteTus: (ids: number[]) => invoke<number>("delete_tus", { ids }),
 
   getOcrSettings: () => invoke<OcrSettings>("get_ocr_settings"),
   setOcrSettings: (s: OcrSettings) => invoke<void>("set_ocr_settings", { settings: s }),
@@ -115,6 +129,7 @@ export const api = {
     invoke<void>("set_entry_enabled", { id, enabled }),
   setEntryTags: (id: number, tags: string[]) => invoke<void>("set_entry_tags", { id, tags }),
   deleteGlossaryEntry: (id: number) => invoke<void>("delete_glossary_entry", { id }),
+  deleteGlossaryEntries: (ids: number[]) => invoke<number>("delete_glossary_entries", { ids }),
 };
 
 export function onOcrProgress(cb: (p: ProgressPayload) => void): Promise<UnlistenFn> {

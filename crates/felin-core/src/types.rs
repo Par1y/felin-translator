@@ -228,6 +228,18 @@ impl Default for TranslationSettings {
     }
 }
 
+/// One proper noun a TU's source matched against the project's *enabled* small
+/// glossary — what translation prompt injection applied. Computed at query time
+/// (no persistence) so existing data shows immediately. `chinese` is `None`
+/// when the entry carries no non-blank Chinese rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchedName {
+    /// The entry's canonical japanese form (as it matched, NFKC-normalized).
+    pub japanese: String,
+    /// The entry's Chinese rendering (None when unset).
+    pub chinese: Option<String>,
+}
+
 /// A TU joined with its translation row and source text — the editable
 /// 原文/译文 card the review screen drives from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +252,9 @@ pub struct TuWithTranslation {
     /// Effective source text: the user's `source_override` if set, else the
     /// concatenated paragraph text.
     pub source: String,
+    /// The enabled small-glossary entries `source` hits, de-duplicated by entry
+    /// id in first-occurrence order (empty when none matched).
+    pub matched_names: Vec<MatchedName>,
     pub final_text: Option<String>,
     pub llm_text: Option<String>,
     pub instruction: Option<String>,
@@ -266,8 +281,8 @@ pub struct GlossaryName {
 
 /// An entry in the project's small glossary (`glossary_entries`).
 ///
-/// Self-contained snapshot (japanese/chinese/english/category/tags/aliases copied
-/// at add-time) so a project archive carries its own glossary; `name_global_id`
+/// Self-contained snapshot (japanese/chinese/english/category/tags copied at
+/// add-time) so a project archive carries its own glossary; `name_global_id`
 /// records provenance in the global big glossary. Translation prompt injection
 /// reads only `enabled = true` entries from here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,8 +295,6 @@ pub struct GlossaryEntry {
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub enabled: bool,
-    /// Japanese alias forms (copied from the global name_aliases at add-time).
-    pub aliases: Vec<String>,
     pub notes: Option<String>,
     pub created_at: String,
     pub updated_at: String,

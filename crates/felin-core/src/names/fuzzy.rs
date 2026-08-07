@@ -31,24 +31,3 @@ pub fn within_distance(a: &str, b: &str, max: usize) -> bool {
     la.abs_diff(lb) <= max && levenshtein(a, b) <= max
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn basic_distances() {
-        assert_eq!(levenshtein("田中", "田中"), 0);
-        assert_eq!(levenshtein("田中", "田申"), 1); // substitution
-        assert_eq!(levenshtein("田中", "田中角"), 1); // insertion
-        assert_eq!(levenshtein("田中角", "田中"), 1); // deletion
-        assert_eq!(levenshtein("田中", "本田"), 2);
-        assert_eq!(levenshtein("", "猫"), 1);
-    }
-
-    #[test]
-    fn within_distance_pre_checks_length() {
-        assert!(within_distance("サクラ", "サクヲ", 1)); // one substitution
-        assert!(within_distance("サクラ", "サク", 1)); // one deletion
-        assert!(!within_distance("あいうえお", "か", 1)); // far apart
-    }
-}

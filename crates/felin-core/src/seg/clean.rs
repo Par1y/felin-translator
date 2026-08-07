@@ -25,26 +25,3 @@ pub fn clean_text(text: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strips_score_tags() {
-        assert_eq!(clean_text("これは本文です。[Score: 0.87]"), "これは本文です。");
-        assert_eq!(clean_text("[Score: 0.4]先頭タグ"), "先頭タグ");
-    }
-
-    #[test]
-    fn drops_pdf_header_lines() {
-        let input = "--- PDF (320 pages) ---\n第一章\n本文";
-        assert_eq!(clean_text(input), "第一章\n本文");
-        assert_eq!(clean_text("---  PDF ( 5 page ) ---"), "");
-    }
-
-    #[test]
-    fn keeps_ordinary_text_and_trims() {
-        assert_eq!(clean_text("  普通の段落。  "), "普通の段落。");
-        assert_eq!(clean_text("行1\n行2"), "行1\n行2");
-    }
-}

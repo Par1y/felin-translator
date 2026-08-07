@@ -17,6 +17,8 @@ import {
 } from "antd";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  CsvMapping,
+  CsvPreviewRow,
   ExtractedName,
   FileSelection,
   ImageMatchRule,
@@ -32,6 +34,22 @@ type GlossaryTarget = "project" | "global";
 function outcomeColor(o: string): string {
   return o === "all_ok" ? "green" : o === "partial" ? "orange" : "red";
 }
+
+/// Sentinel: a CSV column index of `-1` means "不使用该列"（导入时丢弃）。
+const CSV_NOT_USED = -1;
+
+/// CSV 业务字段 → 列映射 UI 行配置（`required` = 必填字段，其下拉不含「不使用」）。
+const CSV_FIELD_ROWS: {
+  key: "japanese" | "chinese" | "english" | "category" | "notes";
+  label: string;
+  required: boolean;
+}[] = [
+  { key: "japanese", label: "日文", required: true },
+  { key: "chinese", label: "中文", required: true },
+  { key: "english", label: "英文", required: false },
+  { key: "category", label: "分类", required: false },
+  { key: "notes", label: "备注", required: false },
+];
 
 export default function ImportPage() {
   const { message } = AntdApp.useApp();
@@ -49,7 +67,10 @@ export default function ImportPage() {
   const [selection, setSelection] = useState<FileSelection | null>(null);
   const [scanning, setScanning] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
-  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  const [progress, setProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [result, setResult] = useState<ImportResult | null>(null);
 
@@ -57,15 +78,112 @@ export default function ImportPage() {
   const [extracting, setExtracting] = useState(false);
   const [candidates, setCandidates] = useState<ExtractedName[]>([]);
   const [confirmTarget, setConfirmTarget] = useState<GlossaryTarget>("project");
+  const [selectedCand, setSelectedCand] = useState<React.Key[]>([]);
 
   // ---- ④ 专名 CSV 导入 ------------------------------------------------------
   const [csvPath, setCsvPath] = useState("");
   const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
-  const [jp, setJp] = useState(0);
-  const [zh, setZh] = useState(1);
-  const [en, setEn] = useState<number | null>(2);
-  const [al, setAl] = useState<number | null>(3);
+  // CSV 列映射：每个业务字段对应一个列索引；CSV_NOT_USED(-1) = 不使用该列（丢弃）。
+  const [csvMap, setCsvMap] = useState({
+    japanese: 0,
+    chinese: 1,
+    english: 2,
+    category: CSV_NOT_USED,
+    notes: CSV_NOT_USED,
+  });
   const [hasHeader, setHasHeader] = useState(true);
+  const [csvPreviewRows, setCsvPreviewRows] = useState<CsvPreviewRow[]>([]);
+  const [csvPreviewErr, setCsvPreviewErr] = useState("");
+
+  // CSV 列映射辅助：下拉选项、已使用/丢弃列、预览列定义、invoke payload。
+  const csvColumnOptions = csvHeaders.map((h, i) => ({
+    value: i,
+    label: hasHeader ? `${h}（第 ${i + 1} 列）` : `第 ${i + 1} 列`,
+  }));
+  const usedColumnSet = new Set(
+    [
+      csvMap.japanese,
+      csvMap.chinese,
+      csvMap.english,
+      csvMap.category,
+      csvMap.notes,
+    ].filter((i) => i >= 0),
+  );
+  const discardedColumns = csvHeaders
+    .map((_, i) => i)
+    .filter((i) => !usedColumnSet.has(i))
+    .map((i) =>
+      hasHeader ? `第 ${i + 1} 列（${csvHeaders[i]}）` : `第 ${i + 1} 列`,
+    );
+  const csvMappingPayload = (): CsvMapping => ({
+    japanese: csvMap.japanese,
+    chinese: csvMap.chinese,
+    english: csvMap.english >= 0 ? csvMap.english : null,
+    category: csvMap.category >= 0 ? csvMap.category : null,
+    notes: csvMap.notes >= 0 ? csvMap.notes : null,
+    has_header: hasHeader,
+  });
+  const csvPreviewColumns: TableProps<CsvPreviewRow>["columns"] = [
+    { title: "日文", dataIndex: "japanese" },
+    { title: "中文", dataIndex: "chinese" },
+    ...(csvMap.english >= 0
+      ? [
+          {
+            title: "英文",
+            dataIndex: "english",
+            render: (v: string | null) => v ?? "—",
+          },
+        ]
+      : []),
+    ...(csvMap.category >= 0
+      ? [
+          {
+            title: "分类",
+            dataIndex: "category",
+            render: (v: string | null) => v ?? "—",
+          },
+        ]
+      : []),
+    ...(csvMap.notes >= 0
+      ? [
+          {
+            title: "备注",
+            dataIndex: "notes",
+            render: (v: string | null) => v ?? "—",
+          },
+        ]
+      : []),
+  ];
+
+  // 按当前列映射自动刷新前几行解析预览（防抖，避免每次下拉改动都重新解析整个文件）。
+  useEffect(() => {
+    if (!csvPath.trim() || csvHeaders.length === 0) {
+      setCsvPreviewRows([]);
+      setCsvPreviewErr("");
+      return;
+    }
+    const mapping: CsvMapping = {
+      japanese: csvMap.japanese,
+      chinese: csvMap.chinese,
+      english: csvMap.english >= 0 ? csvMap.english : null,
+      category: csvMap.category >= 0 ? csvMap.category : null,
+      notes: csvMap.notes >= 0 ? csvMap.notes : null,
+      has_header: hasHeader,
+    };
+    const t = setTimeout(() => {
+      api
+        .csvPreview(csvPath.trim(), mapping, 5)
+        .then((rows) => {
+          setCsvPreviewRows(rows);
+          setCsvPreviewErr("");
+        })
+        .catch((e) => {
+          setCsvPreviewRows([]);
+          setCsvPreviewErr(String(e));
+        });
+    }, 250);
+    return () => clearTimeout(t);
+  }, [csvPath, csvHeaders, csvMap, hasHeader]);
 
   useEffect(() => {
     taskRef.current = taskId;
@@ -76,12 +194,19 @@ export default function ImportPage() {
       onOcrProgress((p: ProgressPayload) => {
         if (p.task_id !== taskRef.current) return;
         const ev = p.event;
-        if (ev.event === "start") setLog((l) => [...l, `开始：共 ${ev.pages_total} 项`]);
+        if (ev.event === "start")
+          setLog((l) => [...l, `开始：共 ${ev.pages_total} 项`]);
         else if (ev.event === "page") {
           setProgress({ done: ev.done, total: ev.total });
-          setLog((l) => [...l, `第 ${ev.page} 项：${ev.status}${ev.error ? ` (${ev.error})` : ""}`]);
+          setLog((l) => [
+            ...l,
+            `第 ${ev.page} 项：${ev.status}${ev.error ? ` (${ev.error})` : ""}`,
+          ]);
         } else if (ev.event === "done") {
-          setLog((l) => [...l, `完成：${ev.pages_ok} 成功 / ${ev.pages_failed} 失败`]);
+          setLog((l) => [
+            ...l,
+            `完成：${ev.pages_ok} 成功 / ${ev.pages_failed} 失败`,
+          ]);
         }
       }),
       onOcrDone((r) => {
@@ -203,7 +328,11 @@ export default function ImportPage() {
     try {
       await api.confirmExtracted(id, confirmTarget);
       await loadCandidates();
-      message.success(confirmTarget === "project" ? "已通过进项目小词库" : "已通过进全局大词库");
+      message.success(
+        confirmTarget === "project"
+          ? "已通过进项目小词库"
+          : "已通过进全局大词库",
+      );
     } catch (e) {
       message.error(String(e));
     }
@@ -218,13 +347,61 @@ export default function ImportPage() {
     }
   };
 
+  const confirmCandidates = async (target: "project" | "global") => {
+    const ids = selectedCand.map(Number);
+    if (ids.length === 0) return;
+    try {
+      const n = await api.confirmExtractedBatch(ids, target);
+      message.success(
+        target === "project"
+          ? `已确认 ${n} 条进项目小词库`
+          : `已确认 ${n} 条进全局大词库`,
+      );
+      setSelectedCand([]);
+      await loadCandidates();
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
+  const rejectCandidates = async () => {
+    const ids = selectedCand.map(Number);
+    if (ids.length === 0) return;
+    try {
+      const n = await api.rejectExtractedBatch(ids);
+      message.success(`已拒绝 ${n} 条`);
+      setSelectedCand([]);
+      await loadCandidates();
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
   const previewCsv = async () => {
     if (!csvPath.trim()) {
       message.warning("请输入 CSV 路径");
       return;
     }
     try {
-      setCsvHeaders(await api.csvHeaders(csvPath.trim()));
+      const headers = await api.csvHeaders(csvPath.trim());
+      setCsvHeaders(headers);
+      // 保留仍然有效的列选择；越界的自动回落到合理默认值（切文件后下拉总有真实选项）。
+      setCsvMap((m) => ({
+        japanese: m.japanese < headers.length ? m.japanese : 0,
+        chinese: m.chinese < headers.length ? m.chinese : 1,
+        english:
+          m.english >= 0 && m.english < headers.length
+            ? m.english
+            : headers.length > 2
+              ? 2
+              : CSV_NOT_USED,
+        category:
+          m.category >= 0 && m.category < headers.length
+            ? m.category
+            : CSV_NOT_USED,
+        notes:
+          m.notes >= 0 && m.notes < headers.length ? m.notes : CSV_NOT_USED,
+      }));
     } catch (e) {
       message.error(String(e));
     }
@@ -235,20 +412,20 @@ export default function ImportPage() {
       message.warning("请输入 CSV 路径");
       return;
     }
+    if (csvMap.japanese === CSV_NOT_USED || csvMap.chinese === CSV_NOT_USED) {
+      message.warning("日文列与中文列为必填，请分别选择对应列");
+      return;
+    }
     try {
       const n = await api.importGlossaryCsv(
         csvPath.trim(),
-        {
-          japanese: jp,
-          chinese: zh,
-          english: en ?? undefined,
-          aliases: al ?? undefined,
-          has_header: hasHeader,
-        },
+        csvMappingPayload(),
         confirmTarget,
       );
       message.success(`导入 ${n} 条`);
       setCsvPath("");
+      setCsvPreviewRows([]);
+      setCsvPreviewErr("");
     } catch (e) {
       message.error(String(e));
     }
@@ -266,7 +443,9 @@ export default function ImportPage() {
           onBlur={(e) => {
             const val = e.target.value;
             if (val !== (v ?? "")) {
-              api.updateExtracted(r.id, val).catch((err) => message.error(String(err)));
+              api
+                .updateExtracted(r.id, val)
+                .catch((err) => message.error(String(err)));
             }
           }}
         />
@@ -277,10 +456,19 @@ export default function ImportPage() {
       width: 150,
       render: (_: unknown, r) => (
         <Space>
-          <Button size="small" type="link" onClick={() => confirmCandidate(r.id)}>
+          <Button
+            size="small"
+            type="link"
+            onClick={() => confirmCandidate(r.id)}
+          >
             通过
           </Button>
-          <Button size="small" type="link" danger onClick={() => rejectCandidate(r.id)}>
+          <Button
+            size="small"
+            type="link"
+            danger
+            onClick={() => rejectCandidate(r.id)}
+          >
             拒绝
           </Button>
         </Space>
@@ -289,7 +477,11 @@ export default function ImportPage() {
   ];
 
   return (
-    <Space direction="vertical" size="large" style={{ width: "100%", maxWidth: 900 }}>
+    <Space
+      direction="vertical"
+      size="large"
+      style={{ width: "100%", maxWidth: 900 }}
+    >
       {/* ① 文本导入：txt / md 直接读入，编码自动检测，源文件原地读取。 */}
       <Card title="文本导入（txt / md）">
         <Space.Compact style={{ width: "100%" }}>
@@ -301,7 +493,10 @@ export default function ImportPage() {
           />
           <Button onClick={importTxt}>导入文本</Button>
         </Space.Compact>
-        <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+        <Typography.Paragraph
+          type="secondary"
+          style={{ marginTop: 8, marginBottom: 0 }}
+        >
           请粘贴文件的绝对路径（编码自动识别）。
         </Typography.Paragraph>
       </Card>
@@ -373,7 +568,10 @@ export default function ImportPage() {
                   min={1}
                   value={rule.range?.[0] ?? undefined}
                   onChange={(v) =>
-                    setRule({ ...rule, range: [v ?? 1, rule.range?.[1] ?? v ?? 1] })
+                    setRule({
+                      ...rule,
+                      range: [v ?? 1, rule.range?.[1] ?? v ?? 1],
+                    })
                   }
                 />
                 <InputNumber
@@ -381,10 +579,15 @@ export default function ImportPage() {
                   min={1}
                   value={rule.range?.[1] ?? undefined}
                   onChange={(v) =>
-                    setRule({ ...rule, range: [rule.range?.[0] ?? v ?? 1, v ?? 1] })
+                    setRule({
+                      ...rule,
+                      range: [rule.range?.[0] ?? v ?? 1, v ?? 1],
+                    })
                   }
                 />
-                <Button onClick={() => setRule({ ...rule, range: null })}>清除范围</Button>
+                <Button onClick={() => setRule({ ...rule, range: null })}>
+                  清除范围
+                </Button>
                 <Button loading={scanning} onClick={scanDir}>
                   扫描预览
                 </Button>
@@ -402,7 +605,11 @@ export default function ImportPage() {
                   styles={{ body: { maxHeight: 180, overflow: "auto" } }}
                 >
                   <Typography.Paragraph
-                    style={{ marginBottom: 0, fontFamily: "monospace", fontSize: 12 }}
+                    style={{
+                      marginBottom: 0,
+                      fontFamily: "monospace",
+                      fontSize: 12,
+                    }}
                   >
                     {selection.names.map((n) => (
                       <div key={n}>{n}</div>
@@ -419,8 +626,11 @@ export default function ImportPage() {
                   导入 {selection?.matched ?? 0} 张图片
                 </Button>
               </Space>
-              <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                目录内混入的 PDF 会被跳过（非预期输入）。
+              <Typography.Paragraph
+                type="secondary"
+                style={{ marginBottom: 0 }}
+              >
+                目录内混入的 PDF 会被跳过。
               </Typography.Paragraph>
             </Space>
           )}
@@ -433,7 +643,11 @@ export default function ImportPage() {
           </Space>
           {progress && (
             <Progress
-              percent={progress.total ? Math.round((progress.done / progress.total) * 100) : 0}
+              percent={
+                progress.total
+                  ? Math.round((progress.done / progress.total) * 100)
+                  : 0
+              }
               status={taskId ? "active" : "normal"}
             />
           )}
@@ -446,7 +660,14 @@ export default function ImportPage() {
           {log.length > 0 && (
             <Card
               size="small"
-              styles={{ body: { maxHeight: 180, overflow: "auto", fontFamily: "monospace", fontSize: 12 } }}
+              styles={{
+                body: {
+                  maxHeight: 180,
+                  overflow: "auto",
+                  fontFamily: "monospace",
+                  fontSize: 12,
+                },
+              }}
             >
               {log.map((l, i) => (
                 <div key={i}>{l}</div>
@@ -477,17 +698,45 @@ export default function ImportPage() {
           </Space>
         }
       >
+        <Space wrap style={{ marginBottom: 8 }}>
+          <Button
+            size="small"
+            disabled={selectedCand.length === 0}
+            onClick={() => confirmCandidates("project")}
+          >
+            确认所选进小词库
+          </Button>
+          <Button
+            size="small"
+            disabled={selectedCand.length === 0}
+            onClick={() => confirmCandidates("global")}
+          >
+            确认所选进大词库
+          </Button>
+          <Button
+            size="small"
+            danger
+            disabled={selectedCand.length === 0}
+            onClick={() => rejectCandidates()}
+          >
+            拒绝所选
+          </Button>
+        </Space>
         <Table
           rowKey="id"
           size="small"
           columns={candidateColumns}
           dataSource={candidates}
+          rowSelection={{
+            selectedRowKeys: selectedCand,
+            onChange: setSelectedCand,
+          }}
           pagination={{ pageSize: 10 }}
           locale={{ emptyText: "暂无候选，先运行抽取" }}
         />
       </Card>
 
-      {/* ④ 专名 CSV 导入：表头预览 + 列选择 + 目标词库。 */}
+      {/* ④ 专名 CSV 导入：表头预览 + 逐字段列映射（未选列丢弃）+ 前几行预览 + 目标词库。 */}
       <Card title="专名 CSV 导入">
         <Space direction="vertical" style={{ width: "100%" }}>
           <Space.Compact style={{ width: "100%" }}>
@@ -503,19 +752,94 @@ export default function ImportPage() {
             </Button>
           </Space.Compact>
           {csvHeaders.length > 0 && (
-            <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-              表头：{csvHeaders.map((h, i) => `${i}:${h}`).join("　")}
-            </Typography.Paragraph>
+            <>
+              <div>
+                <Typography.Text type="secondary">表头：</Typography.Text>
+                {csvHeaders.map((h, i) => (
+                  <Tag
+                    key={i}
+                    color={usedColumnSet.has(i) ? "blue" : "default"}
+                    style={{ marginBottom: 4 }}
+                  >
+                    {hasHeader ? `${h}（第 ${i + 1} 列）` : `第 ${i + 1} 列`}
+                  </Tag>
+                ))}
+              </div>
+              <Typography.Paragraph
+                type="secondary"
+                style={{ marginBottom: 0 }}
+              >
+                蓝色 = 已映射；灰色 = 未选中，导入时丢弃。
+              </Typography.Paragraph>
+
+              <div>
+                <Typography.Text strong>列映射</Typography.Text>
+                <Typography.Text type="secondary">
+                  {"　"}为每个业务字段选择对应的 CSV 列；未选中的列不会被导入。
+                </Typography.Text>
+              </div>
+              {CSV_FIELD_ROWS.map((f) => (
+                <Space key={f.key} wrap>
+                  <Typography.Text style={{ width: 64 }}>
+                    {f.label}
+                    {f.required ? (
+                      <span style={{ color: "#ff4d4f" }}>*</span>
+                    ) : null}
+                  </Typography.Text>
+                  <Select
+                    style={{ width: 300 }}
+                    value={csvMap[f.key]}
+                    onChange={(v) => setCsvMap((m) => ({ ...m, [f.key]: v }))}
+                    options={
+                      f.required
+                        ? csvColumnOptions
+                        : [
+                            {
+                              value: CSV_NOT_USED,
+                              label: "不使用（丢弃该列）",
+                            },
+                            ...csvColumnOptions,
+                          ]
+                    }
+                    placeholder={f.required ? "请选择列" : "不使用（可选）"}
+                  />
+                </Space>
+              ))}
+              {discardedColumns.length > 0 && (
+                <Typography.Paragraph
+                  type="secondary"
+                  style={{ marginBottom: 0 }}
+                >
+                  将被丢弃的列：{discardedColumns.join("、")}
+                </Typography.Paragraph>
+              )}
+
+              <Checkbox
+                checked={hasHeader}
+                onChange={(e) => setHasHeader(e.target.checked)}
+              >
+                含表头
+              </Checkbox>
+
+              <div>
+                <Typography.Text strong>
+                  导入预览（前 {csvPreviewRows.length} 行）
+                </Typography.Text>
+              </div>
+              <Table
+                size="small"
+                rowKey={(_, index) => index ?? 0}
+                pagination={false}
+                dataSource={csvPreviewRows}
+                locale={{
+                  emptyText: csvPreviewErr
+                    ? `预览失败：${csvPreviewErr}`
+                    : "暂无预览数据",
+                }}
+                columns={csvPreviewColumns}
+              />
+            </>
           )}
-          <Space wrap>
-            <InputNumber addonBefore="日文列" min={0} value={jp} onChange={(v) => setJp(v ?? 0)} />
-            <InputNumber addonBefore="中文列" min={0} value={zh} onChange={(v) => setZh(v ?? 1)} />
-            <InputNumber addonBefore="英文列" min={0} value={en ?? undefined} onChange={(v) => setEn(v)} />
-            <InputNumber addonBefore="别名列" min={0} value={al ?? undefined} onChange={(v) => setAl(v)} />
-            <Checkbox checked={hasHeader} onChange={(e) => setHasHeader(e.target.checked)}>
-              含表头
-            </Checkbox>
-          </Space>
         </Space>
       </Card>
     </Space>

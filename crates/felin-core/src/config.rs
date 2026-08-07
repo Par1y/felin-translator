@@ -6,6 +6,7 @@
 //! tune them without recompiling. Missing fields fall back to the defaults here.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Default chapter-heading recognizer pattern (users may add/replace patterns).
 /// A marker must be followed by a separator or end-of-line, so a sentence that
@@ -35,6 +36,7 @@ pub struct TechConfig {
     pub db: DbConfig,
     pub import: ImportConfig,
     pub prompt: PromptConfig,
+    pub debug: DebugConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,32 +129,48 @@ impl Default for ImportConfig {
     }
 }
 
-/// Editable LLM prompt templates (`felin.toml [prompt]`). These replace the
-/// previously hardcoded system/framing text: users can rewrite the
-/// name-extraction system message and the translation system/user message
-/// templates without recompiling. A missing field — or an explicitly empty
-/// string — falls back to the built-in defaults in [`crate::llm::prompt`] /
-/// [`crate::names::extract`].
+/// Editable LLM prompt templates (`felin.toml [prompt]`).
+///
+/// The prompt text sent to the LLM is **never hardcoded in the runtime** — it
+/// is read entirely from `felin.toml`. The single source of truth is the
+/// `[prompt]` section of the first-launch template ([`TechConfig::default_template`],
+/// whose values are fixed by [`factory_prompt_config`]); `Default` here is
+/// *empty* by design, so a config file that omits a field yields an empty
+/// string (that message section is then simply not sent), not a hidden default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptConfig {
-    /// Name-extraction system message (专名抽取). Empty → built-in default.
+    /// Name-extraction system message (专名抽取). Empty → no system message.
     pub extract_system: String,
     /// Translation system-message template with `{guidelines}` / `{instruction}`
-    /// / `{glossary}` placeholders. Empty → built-in default.
+    /// / `{glossary}` placeholders. Empty → no system message.
     pub translation_system: String,
     /// Translation user-message template with `{context}` / `{source}`
-    /// placeholders. Empty → built-in default.
+    /// placeholders. Empty → only the raw source is sent.
     pub translation_user: String,
 }
 
 impl Default for PromptConfig {
     fn default() -> Self {
-        Self {
-            extract_system: crate::names::extract::DEFAULT_EXTRACT_SYSTEM.to_string(),
-            translation_system: crate::llm::prompt::DEFAULT_TRANSLATION_SYSTEM.to_string(),
-            translation_user: crate::llm::prompt::DEFAULT_TRANSLATION_USER.to_string(),
-        }
+        // Deliberately empty: prompt text must come from the config file.
+        Self { extract_system: String::new(), translation_system: String::new(), translation_user: String::new() }
+    }
+}
+
+/// The *factory* prompt templates baked into the first-launch `felin.toml`
+/// (single source of truth for the shipped defaults). Referenced **only** by
+/// [`TechConfig::default_template`] — the runtime never reads these; it uses
+/// whatever the config file says. Editing the values here changes what a fresh
+/// install gets, not what already-configured installs run.
+pub(crate) fn factory_prompt_config() -> PromptConfig {
+    PromptConfig {
+        extract_system: "你是日文专有名词抽取助手。从给定日文文本中抽取专有名词（人名、地名、\
+组织、作品名、独特术语等），忽略普通词汇。只输出 JSON 数组，每项形如 \
+{\"japanese\":\"原文形式\",\"guess_chinese\":\"推测中文\",\"context\":\"简短出处\"}，\
+不要输出任何其他文字。"
+            .to_string(),
+        translation_system: "{guidelines}\n\n附加要求（优先级高于总则）：\n{instruction}\n\n专名参考（词表，必须使用）：\n{glossary}".to_string(),
+        translation_user: "【上文参考（已校对，仅供风格与称谓参考，勿重复翻译）】\n{context}\n\n【待翻译原文】\n{source}".to_string(),
     }
 }
 
@@ -225,6 +243,21 @@ impl Default for PipelineTuning {
     }
 }
 
+/// Diagnostic toggles. Off by default so normal runs stay quiet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugConfig {
+    /// Emit key-operation logs (import / segmentation / translation / name
+    /// extraction / export) for diagnosis. Off by default.
+    pub enabled: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 impl TechConfig {
     /// Parse from a TOML string (missing fields use defaults).
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
@@ -292,22 +325,27 @@ busy_timeout_ms = 5000
 
 [import]
 max_file_bytes = 134217728
+
+[debug]
+# 开启后输出关键操作日志（导入/分段/翻译/专名抽取/导出），便于诊断；默认关。
+enabled = false
 "#,
             // Values are injected TOML-escaped (backslash is the only character
             // that needs it here) so a regex like `\s` survives the round-trip.
             chapter_pattern = toml_escape(DEFAULT_CHAPTER_PATTERN),
             sentence_enders = toml_escape(DEFAULT_SENTENCE_ENDERS),
         );
-        // LLM prompt templates (previously hardcoded), appended last so the
-        // first-launch template stays value-identical to `TechConfig::default()`
-        // (locked by `default_template_matches_defaults`).
-        let prompt_block = toml::to_string_pretty(&PromptConfig::default()).unwrap_or_default();
+        // The factory prompt templates (single source of truth), appended last
+        // with the comment header. Values come from `factory_prompt_config()`,
+        // NOT `PromptConfig::default()` (which is empty by design).
         format!(
-            "{base}\n# 提示词模板（原先硬编码，现可在此整段改写）。\n\
+            "{base}\n# 提示词模板 —— 发送给 LLM 的 prompt 文本完全由本节配置（代码内无默认文本）。\n\
              # 翻译 System 占位符 {{guidelines}} {{instruction}} {{glossary}}；\n\
              # 翻译 User 占位符 {{context}} {{source}}。\n\
-             # 删除某一行即恢复该字段的内置默认；字段留空（\"\"）也按内置默认处理。修改后重启生效。\n\
-             {prompt_block}"
+             # 某字段留空（\"\"）即不发送该消息段。可在设置页「提示词」编辑\n\
+             # （保存后立即生效，无需重启）；也可直接改本文件（重启生效）。\n\
+             {}",
+            prompt_block()
         )
     }
 
@@ -315,6 +353,150 @@ max_file_bytes = 134217728
     pub fn sentence_enders(&self) -> Vec<char> {
         self.seg.sentence_enders.chars().collect()
     }
+
+    /// Load from `felin.toml` on disk, applying the self-documenting template
+    /// when the file is missing — and *healing* an older file that predates the
+    /// `[prompt]` section by appending the factory prompt block (so prompt text
+    /// is always present in the config file, never silently empty). After any
+    /// write the returned config is re-parsed from disk, so it always matches
+    /// what the app actually reads next time.
+    ///
+    /// Returns `(config, written)` where `written` = a template/`[prompt]`
+    /// block was written (fresh install or healed legacy file). The load still
+    /// succeeds if a write fails (config parses as-is rather than a broken file).
+    pub fn load_from_disk(path: &Path) -> (TechConfig, bool) {
+        match std::fs::read_to_string(path) {
+            Ok(s) => match TechConfig::from_toml_str(&s) {
+                Ok(mut c) => {
+                    let written = if !has_prompt_section(&s) {
+                        match append_prompt_block(path, &s) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "could not append [prompt] to felin.toml");
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if written {
+                        // Re-read so the returned config matches the healed file.
+                        if let Ok(text) = std::fs::read_to_string(path) {
+                            if let Ok(p) = TechConfig::from_toml_str(&text) {
+                                c = p;
+                            }
+                        }
+                    }
+                    (c, written)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "invalid felin.toml; using defaults");
+                    (TechConfig::default(), false)
+                }
+            },
+            Err(_) => {
+                // Write the self-documenting template (commented guidance, incl.
+                // the user-managed `[sidecar] bin`/`config` keys and the factory
+                // prompt templates) so advanced users can discover and edit it;
+                // only ever written when the file is missing.
+                let written = std::fs::write(path, TechConfig::default_template()).is_ok();
+                let c = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|t| TechConfig::from_toml_str(&t).ok())
+                    .unwrap_or_default();
+                (c, written)
+            }
+        }
+    }
+}
+
+/// Does the TOML text already contain a top-level `[prompt]` section? Line-based
+/// scan (the whole text is produced by `toml` serde / the template, so a `[`
+/// column-0 table header is unambiguous here).
+fn has_prompt_section(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start() == "[prompt]")
+}
+
+/// Append a `[prompt]` section carrying the factory prompt templates to `path`
+/// when the file lacks one (legacy pre-`[prompt]` installs). Plain string
+/// append — every other section, value and comment is left untouched.
+fn append_prompt_block(path: &Path, current: &str) -> std::io::Result<()> {
+    let ending = if current.is_empty() || current.ends_with('\n') { "" } else { "\n" };
+    std::fs::write(path, format!("{current}{ending}\n{}", prompt_block()))
+}
+
+/// The self-documenting `[prompt]` section with the factory prompt templates
+/// (its single source of truth). The struct serializes as bare fields, so the
+/// table header is added explicitly.
+fn prompt_block() -> String {
+    prompt_block_for(&factory_prompt_config())
+}
+
+/// A `[prompt]` section (header + the three fields) carrying `prompt`'s text —
+/// the string form used whenever a `[prompt]` block is appended to or written
+/// into `felin.toml`.
+fn prompt_block_for(prompt: &PromptConfig) -> String {
+    format!("[prompt]\n{}", toml::to_string_pretty(prompt).unwrap_or_default())
+}
+
+/// Replace or append the top-level `[prompt]` section of `felin.toml` at `path`
+/// with `prompt`, preserving every other section, value and comment.
+///
+/// - No `[prompt]` yet → the new section is appended at the end (mirroring the
+///   legacy healing in [`TechConfig::load_from_disk`]).
+/// - `[prompt]` present → the existing section's header + fields are replaced
+///   in place; everything before the header and after the section's content
+///   (including any blank-line separator before the next section) is preserved
+///   byte-for-byte.
+///
+/// Only `felin.toml` is touched. Returns a clear error if the file cannot be
+/// read or written.
+pub fn set_prompt_section(path: &Path, prompt: &PromptConfig) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let block = prompt_block_for(prompt);
+    let new_text = if has_prompt_section(&text) {
+        replace_prompt_section(&text, &block)
+    } else {
+        let ending = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+        format!("{text}{ending}\n{block}")
+    };
+    std::fs::write(path, new_text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Replace the existing top-level `[prompt]` section (its header line + fields)
+/// in `text` with `block`. The section's region runs from the `[prompt]` header
+/// to just before the next top-level table header (a line whose trimmed form
+/// starts with `[`); the region is cut out and `block` spliced in, so everything
+/// outside it — comments, other sections, and any blank lines separating the
+/// prompt section from the next one — survives byte-for-byte.
+fn replace_prompt_section(text: &str, block: &str) -> String {
+    // Byte offset of the `[prompt]` header (its own line; guaranteed present).
+    let header_start = text.find("[prompt]").expect("caller checked has_prompt_section");
+    let rest = &text[header_start..];
+    // Offset (relative to `rest`) just after the header line's terminator.
+    let body_start = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
+    // End (relative to `rest`) of the last non-blank body line, including its
+    // line terminator — blank lines between the section and the next one are
+    // preserved as part of the untouched suffix.
+    let mut last_content_end = body_start;
+    let mut pos = body_start;
+    while pos < rest.len() {
+        let line_end = rest[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(rest.len());
+        let line = &rest[pos..line_end];
+        if line.trim_start().starts_with('[') {
+            break; // next top-level table header starts the preserved suffix
+        }
+        if !line.trim().is_empty() {
+            last_content_end = line_end;
+        }
+        pos = line_end;
+    }
+    let mut out = String::with_capacity(text.len() + block.len());
+    out.push_str(&text[..header_start]);
+    out.push_str(block);
+    out.push_str(&rest[last_content_end..]);
+    out
 }
 
 /// Escape a value for injection into the TOML default template. The template
@@ -322,44 +504,5 @@ max_file_bytes = 134217728
 /// regex must be doubled to survive a TOML parse→re-serialize round-trip.
 fn toml_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_roundtrips_through_toml() {
-        let s = TechConfig::default().to_toml_string();
-        let back = TechConfig::from_toml_str(&s).unwrap();
-        assert_eq!(back.seg.default_block_size, 3000);
-        assert_eq!(back.ocr.low_score_threshold, 0.6);
-        assert_eq!(back.seg.sentence_enders, DEFAULT_SENTENCE_ENDERS);
-        assert_eq!(back.seg.chapter_heading_patterns, vec![DEFAULT_CHAPTER_PATTERN.to_string()]);
-        assert_eq!(back.llm.max_retries, 3);
-        assert_eq!(back.pipeline.queue_capacity, 64);
-        assert_eq!(back.pipeline.context_max_chars, 4000);
-    }
-
-    #[test]
-    fn partial_toml_fills_missing_with_defaults() {
-        let c = TechConfig::from_toml_str("[ocr]\nlow_score_threshold = 0.8\n").unwrap();
-        assert_eq!(c.ocr.low_score_threshold, 0.8);
-        assert_eq!(c.seg.default_block_size, 3000);
-        assert_eq!(c.sidecar.cancel_grace_secs, 8);
-    }
-
-    #[test]
-    fn default_template_matches_defaults() {
-        // The first-launch felin.toml template must stay value-identical to the
-        // in-code defaults (only comments are added), so parsing it back and
-        // re-serializing yields exactly the default serialization.
-        let from_tpl = TechConfig::from_toml_str(&TechConfig::default_template()).unwrap();
-        assert_eq!(from_tpl.to_toml_string(), TechConfig::default().to_toml_string());
-        // And it documents the user-managed sidecar keys.
-        let tpl = TechConfig::default_template();
-        assert!(tpl.contains("#   bin    = \"/path/to/ocr-router/bin/ocr-cli\""));
-        assert!(tpl.contains("FELIN_SIDECAR_CONFIG"));
-    }
 }
 

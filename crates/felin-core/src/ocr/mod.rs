@@ -25,13 +25,12 @@ pub mod txt;
 use crate::error::{Error, Result};
 use crate::types::IngestedParagraph;
 use contract::{Manifest, PageJson, PageStatus, SUPPORTED_MANIFEST_SCHEMA};
-use ingest::{build_paragraphs, PageForIngest};
 use std::path::Path;
 
 pub use contract::{Manifest as OcrManifest, ProgressEvent};
 pub use sidecar::{ExtractArgs, ExtractOutcome};
 pub use config::{OcrConfig, OcrEvaluatorConfig, OcrProviderConfig};
-
+pub use ingest::{build_paragraphs, ends_with_sentence_punct, split_blocks, PageForIngest};
 /// Default score threshold below which a page's paragraphs are flagged
 /// low-score (used when the evaluator is on). Overridable per project.
 pub const DEFAULT_LOW_SCORE_THRESHOLD: f64 = 0.6;

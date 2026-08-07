@@ -137,6 +137,53 @@ fn refuses_forward_versioned_db() {
 }
 
 #[test]
+fn old_v4_project_db_with_aliases_migrates_cleanly() {
+    // Tolerance for an old archive: its project.db predates the aliases removal
+    // (schema v4, `glossary_entries.aliases` populated). Reopening with the full
+    // migration set must run v5 — rebuild the table without the aliases column —
+    // preserving the other data and never erroring.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("project.db");
+
+    {
+        let db = Db::open(
+            &path,
+            &felin_core::storage::PROJECT_MIGRATIONS[..4],
+            true,
+            DbTuning::default(),
+        )
+        .unwrap();
+        db.write(|c| {
+            c.execute(
+                "INSERT INTO glossary_entries
+                   (japanese, chinese, tags, aliases, notes, created_at, updated_at)
+                 VALUES ('田中', '田中', '[\"人名\"]', '[\"たなか\"]', '注', 't', 't')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let p = ProjectDb::open(&path).unwrap();
+    let entries = p.list_glossary_entries(None).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].japanese, "田中");
+    assert_eq!(entries[0].tags, vec!["人名"]);
+    assert_eq!(entries[0].notes.as_deref(), Some("注"));
+    // The aliases column no longer exists.
+    let cols: Vec<String> = p
+        .db()
+        .read(|c| {
+            let mut stmt = c.prepare("PRAGMA table_info(glossary_entries)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        })
+        .unwrap();
+    assert!(!cols.contains(&"aliases".to_string()));
+}
+
+#[test]
 fn project_lock_is_exclusive_and_released_on_drop() {
     let dir = tempfile::tempdir().unwrap();
     let first = ProjectLock::acquire(dir.path()).unwrap();
@@ -154,11 +201,9 @@ fn glossary_and_extracted_names_roundtrip() {
     let id = g
         .upsert_name_full("田中角栄", Some("田中角荣"), Some("Tanaka"), None, None, "imported", NameStatus::Imported)
         .unwrap();
-    g.add_alias(id, "田中").unwrap();
 
     let forms = g.glossary_forms().unwrap();
     assert!(forms.iter().any(|(f, i)| f == "田中角栄" && *i == id));
-    assert!(forms.iter().any(|(f, i)| f == "田中" && *i == id));
     assert_eq!(g.list_names(10).unwrap().len(), 1);
 
     let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
@@ -229,17 +274,16 @@ fn small_glossary_crud_and_matcher_filters_disabled() {
     let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
 
     let id = p
-        .insert_glossary_entry(None, "田中", Some("田中"), None, None, &["人名".into()], &["たなか".into()], None)
+        .insert_glossary_entry(None, "田中", Some("田中"), None, None, &["人名".into()], None)
         .unwrap();
     let entries = p.list_glossary_entries(None).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].chinese.as_deref(), Some("田中"));
     assert_eq!(entries[0].tags, vec!["人名"]);
-    assert_eq!(entries[0].aliases, vec!["たなか"]);
     assert!(entries[0].enabled);
 
-    // Upsert by japanese refreshes the value fields wholesale (tags/aliases
-    // replaced with what the caller passes), keeps the row and id.
+    // Upsert by japanese refreshes the value fields wholesale (tags replaced
+    // with what the caller passes), keeps the row and id.
     let again = p
         .insert_glossary_entry(
             Some(7),
@@ -248,7 +292,6 @@ fn small_glossary_crud_and_matcher_filters_disabled() {
             None,
             None,
             &["人名".into(), "专名".into()],
-            &["たなか".into(), "中".into()],
             Some("注"),
         )
         .unwrap();
@@ -259,7 +302,7 @@ fn small_glossary_crud_and_matcher_filters_disabled() {
     assert_eq!(entries[0].name_global_id, Some(7));
     assert_eq!(entries[0].tags, vec!["人名", "专名"]);
 
-    // Aliases + japanese feed the matcher; disabled entries are excluded.
+    // Only japanese feeds the matcher; disabled entries are excluded.
     assert_eq!(p.matcher_entries().unwrap().len(), 1);
     p.set_entry_enabled(id, false).unwrap();
     assert!(p.matcher_entries().unwrap().is_empty(), "disabled entries never reach the matcher");
@@ -269,11 +312,9 @@ fn small_glossary_crud_and_matcher_filters_disabled() {
     p.set_entry_tags(id, &["地名".into(), "历史".into()]).unwrap();
     assert_eq!(p.list_glossary_entries(Some("历史")).unwrap().len(), 1);
     assert_eq!(p.list_glossary_entries(Some("不存在")).unwrap().len(), 0);
-    // Search hits aliases too.
-    p.update_glossary_entry(id, "田中", Some("田中"), None, None, &["人名".into()], &["たなか".into(), "中".into()], None)
+    p.update_glossary_entry(id, "田中", Some("田中"), None, None, &["人名".into()], None)
         .unwrap();
-    assert_eq!(p.list_glossary_entries(Some("たなか")).unwrap().len(), 1);
-    assert_eq!(p.list_glossary_entries(Some("中")).unwrap().len(), 1);
+    assert_eq!(p.list_glossary_entries(Some("人名")).unwrap().len(), 1);
 
     p.delete_glossary_entry(id).unwrap();
     assert!(p.list_glossary_entries(None).unwrap().is_empty());
@@ -407,4 +448,170 @@ fn ocr_settings_roundtrip() {
     let back = p.get_ocr_settings().unwrap();
     assert_eq!(back.batch_workers, 2);
     assert!(back.batch_recursive);
+}
+
+#[test]
+fn project_display_name_setting_roundtrip() {
+    // Renaming only writes the display name (`project_name` setting); the slug /
+    // directory are never touched by the DB layer (the command layer enforces
+    // that by never renaming the dir).
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    assert_eq!(p.get_setting("project_name").unwrap(), None);
+    p.set_project_name("少女民俗学").unwrap();
+    assert_eq!(p.get_setting("project_name").unwrap().as_deref(), Some("少女民俗学"));
+    // Renaming overwrites in place.
+    p.set_project_name("别册 少女民俗学").unwrap();
+    assert_eq!(p.get_setting("project_name").unwrap().as_deref(), Some("别册 少女民俗学"));
+}
+
+#[test]
+fn delete_tus_removes_tu_translation_and_unreferenced_paragraphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let ch = p.get_or_create_chapter("c").unwrap();
+
+    let mk = |t: &str| {
+        IngestedParagraph::new(
+            t.into(),
+            None,
+            "b.pdf".into(),
+            None,
+            OcrParagraphStatus::Ok,
+            serde_json::Value::Null,
+        )
+    };
+    let pa = mk("第一段。");
+    let pb = mk("第二段。");
+    let pc = mk("第三段。");
+    p.insert_paragraphs(ch, &[pa.clone(), pb.clone(), pc.clone()]).unwrap();
+
+    // TU1 → [pa, pb]; TU2 → [pb, pc] (pb is shared between both TUs).
+    let mk_tu = |ids: &[String], ord: i64| {
+        p.db()
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO tus (chapter_id, paragraph_ids, ord, budget, status)
+                     VALUES (?1, ?2, ?3, NULL, 'translated')",
+                    rusqlite::params![ch, serde_json::to_string(ids).unwrap(), ord],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .unwrap()
+    };
+    let tu1 = mk_tu(&[pa.id.to_string(), pb.id.to_string()], 0);
+    let tu2 = mk_tu(&[pb.id.to_string(), pc.id.to_string()], 1);
+    // Give TU1 a translation row so we can prove it cascades on delete.
+    p.set_translation_text(tu1, "第一段译文。").unwrap();
+    assert!(p.get_translation(tu1).unwrap().is_some());
+
+    // Delete TU1 only: pa becomes unreferenced and is removed; pb is still
+    // referenced by TU2 (shared) and stays; pc stays (referenced by TU2).
+    assert_eq!(p.delete_tus(&[tu1]).unwrap(), 1);
+    assert!(p.get_tu(tu1).unwrap().is_none());
+    assert!(p.get_tu(tu2).unwrap().is_some());
+    assert!(p.get_translation(tu1).unwrap().is_none(), "translation row cascades");
+    let paras = p.list_paragraphs(ch).unwrap();
+    let ids: Vec<String> = paras.iter().map(|par| par.id.clone()).collect();
+    assert!(!ids.contains(&pa.id.to_string()), "unreferenced paragraph deleted");
+    assert!(ids.contains(&pb.id.to_string()), "shared paragraph kept");
+    assert!(ids.contains(&pc.id.to_string()), "paragraph still referenced by TU2 kept");
+
+    // Delete TU2: pb and pc are now unreferenced and both removed.
+    assert_eq!(p.delete_tus(&[tu2]).unwrap(), 1);
+    assert_eq!(p.count_paragraphs().unwrap(), 0);
+
+    // Empty / missing ids are safe and count nothing.
+    assert_eq!(p.delete_tus(&[]).unwrap(), 0);
+    assert_eq!(p.delete_tus(&[999_999]).unwrap(), 0);
+}
+
+#[test]
+fn delete_glossary_entries_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let id1 = p.insert_glossary_entry(None, "田中", Some("田中"), None, None, &[], None).unwrap();
+    let id2 = p.insert_glossary_entry(None, "猫", Some("猫"), None, None, &[], None).unwrap();
+    let id3 = p.insert_glossary_entry(None, "東京", Some("东京"), None, None, &[], None).unwrap();
+
+    assert_eq!(p.delete_glossary_entries(&[id1, id3]).unwrap(), 2);
+    let rest = p.list_glossary_entries(None).unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].id, id2);
+    assert_eq!(rest[0].japanese, "猫");
+    assert_eq!(p.delete_glossary_entries(&[]).unwrap(), 0);
+}
+
+#[test]
+fn delete_global_names_clears_project_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = GlobalDb::open(&dir.path().join("glossary.db")).unwrap();
+    let gid1 = g
+        .upsert_name_full("田中角栄", Some("田中角荣"), None, None, None, "imported", NameStatus::Imported)
+        .unwrap();
+    let gid2 = g
+        .upsert_name_full("猫", Some("猫"), None, None, None, "imported", NameStatus::Imported)
+        .unwrap();
+    // name_history rows cascade with the name (FK ON DELETE CASCADE).
+    g.record_history(gid1, "chinese", None, Some("田中角荣")).unwrap();
+
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let eid1 = p
+        .insert_glossary_entry(Some(gid1), "田中角栄", Some("田中角荣"), None, None, &["人名".into()], None)
+        .unwrap();
+    let eid2 = p
+        .insert_glossary_entry(Some(gid2), "猫", Some("猫"), None, None, &[], None)
+        .unwrap();
+
+    assert_eq!(g.delete_names(&[gid1]).unwrap(), 1);
+    assert!(g.get_name(gid1).unwrap().is_none());
+    assert!(g.get_name(gid2).unwrap().is_some());
+    let hist: i64 = g
+        .db()
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM name_history WHERE name_id = ?1", [gid1], |r| r.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(hist, 0, "name_history cascades");
+
+    // Small-glossary data is kept; its provenance pointer is cleared.
+    assert_eq!(p.clear_global_provenance(&[gid1]).unwrap(), 1);
+    let entries = p.list_glossary_entries(None).unwrap();
+    let e1 = entries.iter().find(|e| e.id == eid1).unwrap();
+    let e2 = entries.iter().find(|e| e.id == eid2).unwrap();
+    assert_eq!(e1.name_global_id, None);
+    assert_eq!(e2.name_global_id, Some(gid2));
+    assert_eq!(entries.len(), 2, "small-glossary rows survive global deletion");
+}
+
+#[test]
+fn batch_extracted_confirm_and_reject_via_storage() {
+    // The batch reject/confirm commands loop these storage primitives; this
+    // test pins their semantics (status flips + cross-DB upsert side effects).
+    let dir = tempfile::tempdir().unwrap();
+    let g = GlobalDb::open(&dir.path().join("glossary.db")).unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+
+    let mk = |jp: &str| p.insert_extracted(jp, Some(jp), None).unwrap().unwrap();
+    let rej: Vec<i64> = ["誤字A", "誤字B", "誤字C"].iter().map(|jp| mk(jp)).collect();
+    for id in &rej {
+        p.set_extracted_status(*id, ExtractedNameStatus::Rejected, None).unwrap();
+    }
+    assert!(p.list_extracted_names(Some(ExtractedNameStatus::New)).unwrap().is_empty());
+    assert_eq!(p.list_extracted_names(Some(ExtractedNameStatus::Rejected)).unwrap().len(), 3);
+
+    let conf: Vec<i64> = ["サクラ", "ナルト"].iter().map(|jp| mk(jp)).collect();
+    for (i, id) in conf.iter().enumerate() {
+        let jp = format!("占位{i}");
+        let gid = g
+            .upsert_name_full(&jp, Some(&jp), None, None, None, "project:t", NameStatus::Draft)
+            .unwrap();
+        p.insert_glossary_entry(Some(gid), &jp, Some(&jp), None, None, &[], None).unwrap();
+        p.set_extracted_status(*id, ExtractedNameStatus::Confirmed, Some(gid)).unwrap();
+    }
+    let confirmed = p.list_extracted_names(Some(ExtractedNameStatus::Confirmed)).unwrap();
+    assert_eq!(confirmed.len(), 2);
+    assert!(confirmed.iter().all(|c| c.matched_name_id.is_some()));
+    assert!(p.list_extracted_names(Some(ExtractedNameStatus::New)).unwrap().is_empty());
+    assert_eq!(g.count_names().unwrap(), 2, "each confirm upserted into the global pool");
 }

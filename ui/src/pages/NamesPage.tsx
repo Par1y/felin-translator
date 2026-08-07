@@ -6,6 +6,7 @@ import {
   Input,
   List,
   Modal,
+  Popconfirm,
   Select,
   Space,
   Switch,
@@ -38,7 +39,6 @@ export default function NamesPage() {
     english: "",
     category: "",
     tags: [] as string[],
-    aliases: [] as string[],
     notes: "",
   });
 
@@ -49,6 +49,7 @@ export default function NamesPage() {
   const [globalResults, setGlobalResults] = useState<GlossaryName[]>([]);
   const [tagEdit, setTagEdit] = useState<GlossaryName | null>(null);
   const [tagDraft, setTagDraft] = useState<string[]>([]);
+  const [globalSelectedKeys, setGlobalSelectedKeys] = useState<React.Key[]>([]);
 
   const loadEntries = useCallback(
     async (query?: string) => {
@@ -83,7 +84,7 @@ export default function NamesPage() {
   const openEdit = (e?: GlossaryEntry) => {
     if (!e) {
       setEditId(null);
-      setEditForm({ japanese: "", chinese: "", english: "", category: "", tags: [], aliases: [], notes: "" });
+      setEditForm({ japanese: "", chinese: "", english: "", category: "", tags: [], notes: "" });
     } else {
       setEditId(e.id);
       setEditForm({
@@ -92,7 +93,6 @@ export default function NamesPage() {
         english: e.english ?? "",
         category: e.category ?? "",
         tags: e.tags,
-        aliases: e.aliases,
         notes: e.notes ?? "",
       });
     }
@@ -110,7 +110,6 @@ export default function NamesPage() {
       english: editForm.english.trim() || null,
       category: editForm.category.trim() || null,
       tags: editForm.tags,
-      aliases: editForm.aliases,
       notes: editForm.notes.trim() || null,
     };
     try {
@@ -158,6 +157,32 @@ export default function NamesPage() {
     }
   };
 
+  const batchDeleteEntries = async () => {
+    const ids = selectedKeys.map(Number);
+    if (ids.length === 0) return;
+    try {
+      const n = await api.deleteGlossaryEntries(ids);
+      message.success(`已删除 ${n} 条`);
+      setSelectedKeys([]);
+      await loadEntries(q.trim() || undefined);
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
+  const batchDeleteGlobal = async () => {
+    const ids = globalSelectedKeys.map(Number);
+    if (ids.length === 0) return;
+    try {
+      const n = await api.deleteGlobalNames(ids);
+      message.success(`已删除 ${n} 条`);
+      setGlobalSelectedKeys([]);
+      await loadGlobal(gq.trim() || undefined);
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
   const searchFromGlobal = async (query: string) => {
     try {
       setGlobalResults(await api.listGlossary(query || undefined, 100));
@@ -175,7 +200,6 @@ export default function NamesPage() {
         english: g.english,
         category: g.category,
         tags: g.tags,
-        aliases: [],
         notes: g.notes,
       });
       message.success(`已添加 ${g.japanese}`);
@@ -210,7 +234,6 @@ export default function NamesPage() {
     { title: "日文", dataIndex: "japanese", width: 200 },
     { title: "中文", dataIndex: "chinese", width: 160, render: (v: string | null) => v ?? "—" },
     { title: "标签", dataIndex: "tags", render: (v: string[]) => tagsOf(v) },
-    { title: "别名", dataIndex: "aliases", render: (v: string[]) => tagsOf(v) },
     {
       title: "启用",
       dataIndex: "enabled",
@@ -273,7 +296,7 @@ export default function NamesPage() {
                 extra={
                   <Space wrap>
                     <Input.Search
-                      placeholder="搜索日文/中文/标签/别名"
+                      placeholder="搜索日文/中文/标签"
                       value={q}
                       onChange={(e) => setQ(e.target.value)}
                       onSearch={searchEntries}
@@ -284,6 +307,19 @@ export default function NamesPage() {
                     <Button onClick={() => setFromGlobalOpen(true)}>从全局搜索添加</Button>
                     <Button onClick={() => batchSetEnabled(true)}>批量启用</Button>
                     <Button onClick={() => batchSetEnabled(false)}>批量禁用</Button>
+                    <Popconfirm
+                      title={`删除所选 ${selectedKeys.length} 个词条？`}
+                      description="将从项目小词库移除，此操作不可撤销。"
+                      okText="删除"
+                      cancelText="取消"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => void batchDeleteEntries()}
+                      disabled={selectedKeys.length === 0}
+                    >
+                      <Button danger disabled={selectedKeys.length === 0}>
+                        删除所选（{selectedKeys.length}）
+                      </Button>
+                    </Popconfirm>
                   </Space>
                 }
               >
@@ -309,14 +345,29 @@ export default function NamesPage() {
               <Card
                 title="全局大词库"
                 extra={
-                  <Input.Search
-                    placeholder="搜索日文/中文/标签"
-                    value={gq}
-                    onChange={(e) => setGq(e.target.value)}
-                    onSearch={searchGlobal}
-                    allowClear
-                    style={{ width: 220 }}
-                  />
+                  <Space wrap>
+                    <Input.Search
+                      placeholder="搜索日文/中文/标签"
+                      value={gq}
+                      onChange={(e) => setGq(e.target.value)}
+                      onSearch={searchGlobal}
+                      allowClear
+                      style={{ width: 220 }}
+                    />
+                    <Popconfirm
+                      title={`删除所选 ${globalSelectedKeys.length} 个全局词条？`}
+                      description="将从全局大词库移除（各项目对它的引用会被清除），此操作不可撤销。"
+                      okText="删除"
+                      cancelText="取消"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => void batchDeleteGlobal()}
+                      disabled={globalSelectedKeys.length === 0}
+                    >
+                      <Button danger disabled={globalSelectedKeys.length === 0}>
+                        删除所选（{globalSelectedKeys.length}）
+                      </Button>
+                    </Popconfirm>
+                  </Space>
                 }
               >
                 <Table
@@ -324,6 +375,7 @@ export default function NamesPage() {
                   size="small"
                   columns={globalColumns}
                   dataSource={globalNames}
+                  rowSelection={{ selectedRowKeys: globalSelectedKeys, onChange: setGlobalSelectedKeys }}
                   pagination={{ pageSize: 10 }}
                   locale={{ emptyText: "暂无词条" }}
                 />
@@ -355,13 +407,6 @@ export default function NamesPage() {
             placeholder="标签（回车添加）"
             value={editForm.tags}
             onChange={(v: string[]) => setEditForm({ ...editForm, tags: v })}
-            style={{ width: "100%" }}
-          />
-          <Select
-            mode="tags"
-            placeholder="别名（回车添加）"
-            value={editForm.aliases}
-            onChange={(v: string[]) => setEditForm({ ...editForm, aliases: v })}
             style={{ width: "100%" }}
           />
           <Typography.Text>备注</Typography.Text>

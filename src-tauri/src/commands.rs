@@ -11,6 +11,7 @@
 
 use crate::state::{AppState, OpenProject};
 use felin_core::archive;
+use felin_core::config::PromptConfig;
 use felin_core::llm::{LlmClient, prompt::TranslateRequest};
 use felin_core::names;
 use felin_core::ocr::contract::PageStatus;
@@ -145,6 +146,12 @@ fn meta_path(root: &Path) -> PathBuf {
     root.join("project.json")
 }
 
+/// Read and parse a project's `project.json` summary.
+fn read_project_json(root: &Path) -> Result<ProjectSummary, String> {
+    serde_json::from_slice(&std::fs::read(meta_path(root)).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
 /// Read a regular file, rejecting non-files (FIFO/device) and anything over `max`.
 fn read_regular_capped(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -211,7 +218,7 @@ pub fn create_project(state: State<'_, AppState>, name: String) -> Result<Projec
     let summary = ProjectSummary { slug: slug.clone(), name: name.clone(), created_at: created_at.clone() };
     std::fs::write(meta_path(&root), serde_json::to_vec_pretty(&summary).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    db.set_setting("project_name", &name).map_err(|e| e.to_string())?;
+    db.set_project_name(&name).map_err(|e| e.to_string())?;
     db.set_setting("created_at", &created_at).map_err(|e| e.to_string())?;
 
     *state.project_guard() = Some(OpenProject { slug, name, root, db: Arc::new(db), lock });
@@ -270,6 +277,74 @@ pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectSummary>, 
     }
     out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Ok(out)
+}
+
+/// Rename a project's **display name** only — the disk directory and slug are
+/// never touched. Updates `project.json` (preserving slug/created_at) and the
+/// project's `project_name` setting; if the renamed project is the currently
+/// open one, the in-memory `OpenProject.name` is synced so the main title
+/// updates immediately. Returns the updated summary.
+#[tauri::command]
+pub fn rename_project(state: State<'_, AppState>, slug: String, name: String) -> Result<ProjectSummary, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("项目名称不能为空".into());
+    }
+    if !is_valid_slug(&slug) {
+        return Err(format!("无效的项目 id：{slug:?}"));
+    }
+    let root = state.projects_dir().join(&slug);
+    if !meta_path(&root).exists() {
+        return Err(format!("项目 '{slug}' 不存在"));
+    }
+
+    let mut summary = read_project_json(&root)?;
+    summary.name = name.clone();
+    std::fs::write(meta_path(&root), serde_json::to_vec_pretty(&summary).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+
+    // Keep the `project_name` setting consistent. When this project is open,
+    // reuse its live DB and sync the open project's name; otherwise open the DB
+    // briefly just to update the setting.
+    let mut guard = state.project_guard();
+    match guard.as_mut() {
+        Some(p) if p.slug == slug => {
+            p.db.set_project_name(&name).map_err(|e| e.to_string())?;
+            p.name = name;
+        }
+        _ => {
+            let db = ProjectDb::open_with(&root.join("project.db"), db_tuning(&state))
+                .map_err(|e| e.to_string())?;
+            db.set_project_name(&name).map_err(|e| e.to_string())?;
+        }
+    }
+    drop(guard);
+
+    Ok(summary)
+}
+
+/// Delete an entire project directory (`<projects_dir>/<slug>`, including its
+/// OCR products). Archives are never touched. If the deleted project is the
+/// currently open one, it is closed first (releasing the DB + single-open lock
+/// and clearing the open-project slot).
+#[tauri::command]
+pub fn delete_project(state: State<'_, AppState>, slug: String) -> Result<(), String> {
+    if !is_valid_slug(&slug) {
+        return Err(format!("无效的项目 id：{slug:?}"));
+    }
+    let root = state.projects_dir().join(&slug);
+    if !root.is_dir() {
+        return Err(format!("项目 '{slug}' 不存在"));
+    }
+
+    {
+        let mut guard = state.project_guard();
+        if guard.as_ref().is_some_and(|p| p.slug == slug) {
+            *guard = None; // drops the open db (Arc) then the lock
+        }
+    }
+
+    std::fs::remove_dir_all(&root).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -339,6 +414,9 @@ pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<S
         let llm_cfg = load_llm_config(&proj.db, &state.config.llm)?;
         (Arc::clone(&proj.db), settings, llm_cfg)
     };
+    // The runtime-effective prompt templates (updated in place by the settings
+    // page's `set_prompt_config`, so this run uses the latest text).
+    let prompt = state.prompt_config();
     let cfg = RunConfig {
         workers: settings.workers as usize,
         window: settings.window as usize,
@@ -347,9 +425,10 @@ pub fn start_translation(app: AppHandle, state: State<'_, AppState>) -> Result<S
         queue_capacity: state.config.pipeline.queue_capacity,
         context_max_chars: state.config.pipeline.context_max_chars,
         guidelines_max_chars: state.config.pipeline.guidelines_max_chars,
-        system_template: state.config.prompt.translation_system.clone(),
-        user_template: state.config.prompt.translation_user.clone(),
+        system_template: prompt.translation_system.clone(),
+        user_template: prompt.translation_user.clone(),
     };
+    drop(prompt);
     // Build the translator now so config errors reject the invoke synchronously
     // (before any task_id / events exist).
     let translator = Arc::new(LlmTranslator {
@@ -577,6 +656,26 @@ pub fn set_guidelines(state: State<'_, AppState>, text: String) -> Result<(), St
     with_project(&state, |p| p.db.set_guidelines(&text))
 }
 
+/// The runtime-effective `[prompt]` templates from felin.toml (empty fields are
+/// returned verbatim — an empty string means that message section isn't sent).
+/// App-level: no project needs to be open.
+#[tauri::command]
+pub fn get_prompt_config(state: State<'_, AppState>) -> Result<PromptConfig, String> {
+    Ok(state.prompt_config().clone())
+}
+
+/// Write the `[prompt]` section back to `<data_dir>/felin.toml` (other
+/// sections/comments preserved) and apply it to the live config immediately —
+/// the very next translation / name-extraction run uses the new text, no
+/// restart required. Returns a clear error if felin.toml cannot be written.
+#[tauri::command]
+pub fn set_prompt_config(state: State<'_, AppState>, config: PromptConfig) -> Result<(), String> {
+    let path = state.data_dir.join("felin.toml");
+    felin_core::config::set_prompt_section(&path, &config)?;
+    *state.prompt_config() = config;
+    Ok(())
+}
+
 /// A TU joined with its translation row — the read-only status list the review
 /// screen drives from (step 8's minimal UI).
 #[tauri::command]
@@ -607,6 +706,16 @@ pub fn set_translation_text(
     text: String,
 ) -> Result<bool, String> {
     with_project(&state, |p| p.db.set_translation_text(tu_id, &text))
+}
+
+/// Batch-delete TUs — any status, including `translating`/`approved`/`exported`
+/// (the user deletes 不需要/识别错误的段 outright). Each TU's translation row is
+/// removed (FK cascade), and its paragraphs are removed when no other TU still
+/// references them (shared paragraphs are kept). The frontend re-pulls the list
+/// afterwards. Returns how many TUs were deleted.
+#[tauri::command]
+pub fn delete_tus(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    with_project(&state, |p| p.db.delete_tus(&ids))
 }
 
 /// Re-translate a batch of TUs: requeue each (with an optional per-run
@@ -676,13 +785,15 @@ pub fn export_translations(
     state: State<'_, AppState>,
     dest_dir: String,
 ) -> Result<TranslationExport, String> {
-    with_project(&state, |p| p.db.export_translations(Path::new(&dest_dir)))
+    let out = with_project(&state, |p| p.db.export_translations(Path::new(&dest_dir)))?;
+    tracing::debug!(dest_dir, tus = out.tus, "translation export finished");
+    Ok(out)
 }
 
 // ----- project small glossary (self-contained, travels with the archive) ----
 
 /// List the project's small-glossary entries, optionally filtered by a
-/// free-text query (matches japanese/chinese/english/tags/aliases).
+/// free-text query (matches japanese/chinese/english/tags).
 #[tauri::command]
 pub fn list_glossary_entries(
     state: State<'_, AppState>,
@@ -692,10 +803,9 @@ pub fn list_glossary_entries(
 }
 
 /// Add an entry to the project's small glossary (upsert by japanese). When
-/// `name_global_id` is given (a "from global search add"), the global entry's
-/// aliases are copied so the project archive stays self-contained.
+/// `name_global_id` is given (a "from global search add"), provenance is
+/// recorded so the project archive stays self-contained.
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 pub fn add_glossary_entry(
     state: State<'_, AppState>,
     name_global_id: Option<i64>,
@@ -704,23 +814,16 @@ pub fn add_glossary_entry(
     english: Option<String>,
     category: Option<String>,
     tags: Vec<String>,
-    aliases: Vec<String>,
     notes: Option<String>,
 ) -> Result<i64, String> {
     let guard = state.project_guard();
     let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
-    let mut aliases = aliases;
     if let Some(gid) = name_global_id {
         state
             .global
             .get_name(gid)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "global entry not found".to_string())?;
-        for a in state.global.aliases_for(gid).map_err(|e| e.to_string())? {
-            if !aliases.contains(&a) {
-                aliases.push(a);
-            }
-        }
     }
     proj.db
         .insert_glossary_entry(
@@ -730,14 +833,12 @@ pub fn add_glossary_entry(
             english.as_deref(),
             category.as_deref(),
             &tags,
-            &aliases,
             notes.as_deref(),
         )
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 pub fn update_glossary_entry(
     state: State<'_, AppState>,
     id: i64,
@@ -746,7 +847,6 @@ pub fn update_glossary_entry(
     english: Option<String>,
     category: Option<String>,
     tags: Vec<String>,
-    aliases: Vec<String>,
     notes: Option<String>,
 ) -> Result<(), String> {
     with_project(&state, |p| {
@@ -757,7 +857,6 @@ pub fn update_glossary_entry(
             english.as_deref(),
             category.as_deref(),
             &tags,
-            &aliases,
             notes.as_deref(),
         )
     })
@@ -786,6 +885,13 @@ pub fn set_entry_tags(
 #[tauri::command]
 pub fn delete_glossary_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     with_project(&state, |p| p.db.delete_glossary_entry(id))
+}
+
+/// Batch-delete entries from the project small glossary. Returns how many were
+/// deleted.
+#[tauri::command]
+pub fn delete_glossary_entries(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    with_project(&state, |p| p.db.delete_glossary_entries(&ids))
 }
 
 // ----- global big glossary (shared pool, tag/enabled managed here) ----------
@@ -821,6 +927,21 @@ pub fn set_global_name_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     state.global.set_name_enabled(id, enabled).map_err(|e| e.to_string())
+}
+
+/// Batch-delete global big-glossary entries (`name_history` cascades via FK).
+/// Project small-glossary entries that carry `name_global_id` provenance for a
+/// deleted name are kept, with the pointer cleared on the currently open project
+/// so no dangling cross-file reference survives. Returns how many global entries
+/// were deleted.
+#[tauri::command]
+pub fn delete_global_names(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    let n = state.global.delete_names(&ids).map_err(|e| e.to_string())?;
+    let guard = state.project_guard();
+    if let Some(p) = guard.as_ref() {
+        p.db.clear_global_provenance(&ids).map_err(|e| e.to_string())?;
+    }
+    Ok(n)
 }
 
 /// Round-trip one tiny translation through the configured model — the Settings
@@ -869,6 +990,7 @@ pub fn segment_project(state: State<'_, AppState>, budget: Option<i64>) -> Resul
                 .unwrap_or(default_block),
         };
         let out = p.db.segment(block, &fallback, &recognizer)?;
+        tracing::debug!(chapters = out.chapters, tus = out.tus, block_size = block, "segmentation complete");
         Ok(SegmentResult { chapters: out.chapters, tus: out.tus })
     })
 }
@@ -1031,6 +1153,7 @@ async fn run_import(
     max_manifest_bytes: u64,
     rx: watch::Receiver<bool>,
 ) -> Result<ImportResult, String> {
+    tracing::debug!(task_id, input = %args.input.display(), "OCR import started");
     let app_prog = app.clone();
     let tid = task_id.to_string();
     let outcome = run_extract(
@@ -1057,6 +1180,15 @@ async fn run_import(
     // Ingest into the captured project (no global state lock held here).
     let ch = db.get_or_create_chapter(&stem).map_err(|e| e.to_string())?;
     db.insert_paragraphs(ch, &res.paragraphs).map_err(|e| e.to_string())?;
+
+    tracing::debug!(
+        task_id,
+        outcome = outcome_str(outcome),
+        pages_ok = res.pages_ok,
+        pages_failed = res.failed_pages.len(),
+        paragraphs = res.paragraphs.len(),
+        "OCR import finished"
+    );
 
     Ok(ImportResult {
         task_id: task_id.to_string(),
@@ -1419,7 +1551,6 @@ pub struct CsvMapping {
     pub english: Option<usize>,
     pub category: Option<usize>,
     pub notes: Option<usize>,
-    pub aliases: Option<usize>,
     pub has_header: bool,
 }
 
@@ -1431,7 +1562,6 @@ impl CsvMapping {
             english: self.english,
             category: self.category,
             notes: self.notes,
-            aliases: self.aliases,
             has_header: self.has_header,
         }
     }
@@ -1517,6 +1647,23 @@ pub fn csv_headers(state: State<'_, AppState>, path: String) -> Result<Vec<Strin
     names::csv::headers(&data).map_err(|e| e.to_string())
 }
 
+/// Preview the first `limit` parsed rows of a glossary CSV under `mapping` —
+/// the read-only "按当前列映射的前几行解析结果" the import card shows so the
+/// user can confirm their column selection (and see that unmapped columns are
+/// dropped) before committing to the import.
+#[tauri::command]
+pub fn csv_preview(
+    state: State<'_, AppState>,
+    path: String,
+    mapping: CsvMapping,
+    limit: Option<usize>,
+) -> Result<Vec<names::NameRow>, String> {
+    let data = read_regular_capped(Path::new(&path), state.config.import.max_file_bytes)?;
+    let rows = names::csv::parse(&data, &mapping.into_core()).map_err(|e| e.to_string())?;
+    let limit = limit.unwrap_or(5);
+    Ok(rows.into_iter().take(limit).collect())
+}
+
 /// Import a glossary CSV. `target` = `"project"` (project small glossary) or
 /// `"global"` (shared big glossary). Project-target rows are ALSO upserted into
 /// the global pool (accumulating the shared glossary) with a source tag naming
@@ -1559,9 +1706,6 @@ pub fn import_glossary_csv(
                 NameStatus::Imported,
             )
             .map_err(|e| e.to_string())?;
-        for a in &row.aliases {
-            state.global.add_alias(id, a).map_err(|e| e.to_string())?;
-        }
         if to_project {
             // Carry over any existing global tags plus the source-project tag.
             let mut tags: Vec<String> = state
@@ -1582,7 +1726,6 @@ pub fn import_glossary_csv(
                 row.english.as_deref(),
                 row.category.as_deref(),
                 &tags,
-                &row.aliases,
                 row.notes.as_deref(),
             )
             .map_err(|e| e.to_string())?;
@@ -1601,12 +1744,13 @@ pub fn import_glossary_csv(
 pub async fn run_name_extraction(state: State<'_, AppState>) -> Result<usize, String> {
     // Gather the client + chapter texts under the lock, then release it before
     // awaiting the network calls. The extraction system message comes from
-    // felin.toml `[prompt].extract_system` (empty → built-in default).
+    // felin.toml `[prompt].extract_system` (empty → no system message, just the
+    // chapter text — the config file is the single source of prompt text).
     let (client, chapters, extract_system) = {
         let guard = state.project_guard();
         let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
         let client = LlmClient::new(load_llm_config(&proj.db, &state.config.llm)?).map_err(|e| e.to_string())?;
-        let extract_system = state.config.prompt.extract_system.clone();
+        let extract_system = state.prompt_config().extract_system.clone();
         let mut chapters = Vec::new();
         for ch in proj.db.list_chapters().map_err(|e| e.to_string())? {
             let text = proj
@@ -1667,24 +1811,40 @@ pub fn reject_extracted(state: State<'_, AppState>, id: i64) -> Result<(), Strin
     with_project(&state, |p| p.db.set_extracted_status(id, ExtractedNameStatus::Rejected, None))
 }
 
-/// Confirm a candidate into a glossary. `target` = `"project"` (project small
-/// glossary) or `"global"` (shared big glossary). Either way the candidate is
-/// upserted into the global pool too (accumulating the shared glossary, with a
-/// source tag naming this project); `"project"` additionally copies it into the
-/// project's self-contained small glossary.
+/// Batch-reject extracted candidates (mark `Rejected`). Returns how many were
+/// processed.
 #[tauri::command]
-pub fn confirm_extracted(
-    state: State<'_, AppState>,
+pub fn reject_extracted_batch(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    with_project(&state, |p| {
+        let mut n = 0usize;
+        for id in ids {
+            p.db.set_extracted_status(id, ExtractedNameStatus::Rejected, None)?;
+            n += 1;
+        }
+        Ok(n)
+    })
+}
+
+/// Resolve the glossary target string shared by the confirm commands.
+fn parse_target(target: &str) -> Result<bool, String> {
+    match target {
+        "project" => Ok(true),
+        "global" => Ok(false),
+        other => Err(format!("unknown glossary target: {other}")),
+    }
+}
+
+/// Confirm one candidate into a glossary — the shared body of
+/// [`confirm_extracted`] / [`confirm_extracted_batch`]. `to_project` = the
+/// candidate lands in the project's self-contained small glossary (it is always
+/// upserted into the global pool too, accumulating the shared glossary with a
+/// source tag naming this project).
+fn confirm_extracted_one(
+    state: &AppState,
+    proj: &OpenProject,
     id: i64,
-    target: String,
+    to_project: bool,
 ) -> Result<(), String> {
-    let to_project = match target.as_str() {
-        "project" => true,
-        "global" => false,
-        other => return Err(format!("unknown glossary target: {other}")),
-    };
-    let guard = state.project_guard();
-    let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
     let cand = proj
         .db
         .get_extracted(id)
@@ -1715,7 +1875,6 @@ pub fn confirm_extracted(
     }
     state.global.set_name_tags(name_id, &tags).map_err(|e| e.to_string())?;
     if to_project {
-        let global_aliases = state.global.aliases_for(name_id).map_err(|e| e.to_string())?;
         proj.db
             .insert_glossary_entry(
                 Some(name_id),
@@ -1724,7 +1883,6 @@ pub fn confirm_extracted(
                 None,
                 None,
                 &tags,
-                &global_aliases,
                 None,
             )
             .map_err(|e| e.to_string())?;
@@ -1733,6 +1891,42 @@ pub fn confirm_extracted(
         .set_extracted_status(id, ExtractedNameStatus::Confirmed, Some(name_id))
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn confirm_extracted(
+    state: State<'_, AppState>,
+    id: i64,
+    target: String,
+) -> Result<(), String> {
+    let to_project = parse_target(&target)?;
+    let guard = state.project_guard();
+    let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
+    confirm_extracted_one(&state, proj, id, to_project)
+}
+
+/// Batch-confirm candidates into a glossary (`target` = `"project"` / `"global"`),
+/// running each through the same path as [`confirm_extracted`]. Executed
+/// per-candidate: on a failure the run stops and the error reports how many
+/// succeeded (already-confirmed candidates stay confirmed — no rollback).
+/// Returns the number of candidates confirmed.
+#[tauri::command]
+pub fn confirm_extracted_batch(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+    target: String,
+) -> Result<usize, String> {
+    let to_project = parse_target(&target)?;
+    let guard = state.project_guard();
+    let proj = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
+    let mut done = 0usize;
+    for id in ids {
+        if let Err(e) = confirm_extracted_one(&state, proj, id, to_project) {
+            return Err(format!("第 {} 条确认失败（已确认 {done} 条）：{e}", done + 1));
+        }
+        done += 1;
+    }
+    Ok(done)
 }
 
 

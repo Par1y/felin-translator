@@ -94,7 +94,6 @@ export interface GlossaryEntry {
   category: string | null;
   tags: string[];
   enabled: boolean;
-  aliases: string[];
   notes: string | null;
   created_at: string;
   updated_at: string;
@@ -107,7 +106,6 @@ export interface GlossaryEntryInput {
   english: string | null;
   category: string | null;
   tags: string[];
-  aliases: string[];
   notes: string | null;
 }
 
@@ -196,11 +194,20 @@ export interface LlmConfigView {
 export interface CsvMapping {
   japanese: number;
   chinese: number;
-  english?: number;
-  category?: number;
-  notes?: number;
-  aliases?: number;
+  english?: number | null;
+  category?: number | null;
+  notes?: number | null;
   has_header: boolean;
+}
+
+/// One parsed glossary row, as returned by `csv_preview` (unmapped optional
+/// fields come back `null`).
+export interface CsvPreviewRow {
+  japanese: string;
+  chinese: string;
+  english: string | null;
+  category: string | null;
+  notes: string | null;
 }
 
 // Matches felin_core::ocr::contract::ProgressEvent (tagged by "event").
@@ -255,6 +262,14 @@ export interface TranslationSettings {
   stop_aborts_inflight: boolean;
 }
 
+// Mirrors felin_core::config::PromptConfig (felin.toml [prompt] templates).
+// Empty field = that message section isn't sent.
+export interface PromptConfig {
+  extract_system: string;
+  translation_system: string;
+  translation_user: string;
+}
+
 export interface StatusCount {
   status: string;
   count: number;
@@ -269,6 +284,14 @@ export interface TranslationStatusView {
   counts: StatusCount[];
 }
 
+// Mirrors felin_core::types::MatchedName — a proper noun a TU's source hit.
+export interface MatchedName {
+  /** The entry's canonical japanese form (as it matched). */
+  japanese: string;
+  /** The entry's Chinese rendering (null when unset). */
+  chinese: string | null;
+}
+
 // Mirrors felin_core::types::TuWithTranslation.
 export interface TuWithTranslation {
   id: number;
@@ -278,6 +301,8 @@ export interface TuWithTranslation {
   translation_status: string | null;
   /** Effective source: the user's source_override if set, else the paragraphs. */
   source: string;
+  /** Enabled small-glossary entries this source hit (what prompt injection applied). */
+  matched_names: MatchedName[];
   final_text: string | null;
   llm_text: string | null;
   instruction: string | null;

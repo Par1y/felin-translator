@@ -33,6 +33,7 @@ pub const PROJECT_MIGRATIONS: &[Migration] = &[
     Migration { version: 2, sql: include_str!("migrations/project/0002_translations_unique.sql") },
     Migration { version: 3, sql: include_str!("migrations/project/0003_glossary_entries.sql") },
     Migration { version: 4, sql: include_str!("migrations/project/0004_tu_source_override.sql") },
+    Migration { version: 5, sql: include_str!("migrations/project/0005_remove_aliases.sql") },
 ];
 
 /// Typed wrapper over a single project's database.
@@ -82,6 +83,13 @@ impl ProjectDb {
             .map(Option::flatten)
             .map_err(Into::into)
         })
+    }
+
+    /// Persist the project's display name (the `project_name` setting, also
+    /// mirrored in `project.json`). Renaming only touches the display name —
+    /// the disk directory / slug are never changed.
+    pub fn set_project_name(&self, name: &str) -> Result<()> {
+        self.set_setting("project_name", name)
     }
 
     // ----- chapters -------------------------------------------------------
@@ -524,6 +532,60 @@ impl ProjectDb {
         })
     }
 
+    /// Batch-delete TUs — any status, including `translating`/`approved`/
+    /// `exported` (the user deletes 不需要/识别错误的段 outright). Each TU's
+    /// translation row cascades via FK. A paragraph referenced by a deleted TU
+    /// is removed only if **no remaining TU** still references it (a paragraph
+    /// may belong to several TUs; shared paragraphs are kept). All inside one
+    /// transaction. Returns the number of TUs actually deleted.
+    pub fn delete_tus(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.db.write(|conn| {
+            let tx = conn.transaction()?;
+            // Collect every paragraph the deleted TUs referenced.
+            let mut paras: Vec<String> = Vec::new();
+            {
+                let mut stmt = tx.prepare("SELECT paragraph_ids FROM tus WHERE id = ?1")?;
+                for id in ids {
+                    let json: Option<String> = stmt.query_row([id], |r| r.get(0)).optional()?;
+                    if let Some(json) = json {
+                        if let Ok(list) = serde_json::from_str::<Vec<String>>(&json) {
+                            paras.extend(list);
+                        }
+                    }
+                }
+            }
+            // Drop the TU rows (translations rows cascade via FK).
+            let mut deleted = 0usize;
+            {
+                let mut stmt = tx.prepare("DELETE FROM tus WHERE id = ?1")?;
+                for id in ids {
+                    if stmt.execute([id])? == 1 {
+                        deleted += 1;
+                    }
+                }
+            }
+            // A paragraph survives if any remaining TU still references it
+            // (paragraph_ids is a JSON array of UUID strings, so a quoted-uuid
+            // containment match is exact — UUIDs contain no `%`/`_`).
+            {
+                let mut refs = tx.prepare("SELECT COUNT(*) FROM tus WHERE paragraph_ids LIKE ?1")?;
+                let mut del = tx.prepare("DELETE FROM paragraphs WHERE id = ?1")?;
+                for pid in paras {
+                    let pattern = format!("%\"{pid}\"%");
+                    let n: i64 = refs.query_row([&pattern], |r| r.get(0))?;
+                    if n == 0 {
+                        del.execute([&pid])?;
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(deleted)
+        })
+    }
+
     // ----- pipeline queries -------------------------------------------------
 
     /// TU ids eligible for translation in the given chapters, ordered by
@@ -649,7 +711,11 @@ impl ProjectDb {
     /// TUs of a chapter joined with their translation rows, for the review
     /// cards. `source` is the effective 原文 — the user's `source_override` if
     /// set (non-blank), else the TU's paragraphs concatenated in order.
+    /// `matched_names` are the *enabled* small-glossary entries `source` hits
+    /// (what prompt injection applied), computed here at query time from the
+    /// same matcher data — one compilation shared across all the TUs.
     pub fn list_tus_with_translations(&self, chapter_id: i64) -> Result<Vec<TuWithTranslation>> {
+        let glossary = crate::pipeline::prompt::GlossaryMatcher::build(&self.matcher_entries()?)?;
         self.db.read(|c| {
             // Load this chapter's paragraph text once, keyed by id, so effective
             // sources resolve without one query per TU.
@@ -687,6 +753,8 @@ impl ProjectDb {
                         parts.join("\n")
                     }
                 };
+                let matched_names =
+                    glossary.as_ref().map_or_else(Vec::new, |g| g.matched_names(&source));
                 Ok(TuWithTranslation {
                     id: r.get(0)?,
                     ord: r.get(1)?,
@@ -699,6 +767,7 @@ impl ProjectDb {
                     error: r.get(10)?,
                     source_hash: r.get(11)?,
                     source,
+                    matched_names,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -806,7 +875,6 @@ impl ProjectDb {
     /// Insert a glossary entry, or refresh an existing one matched by `japanese`
     /// (value fields overwrite; timestamps update). `name_global_id` records
     /// provenance in the global big glossary. Returns the row id.
-    #[allow(clippy::too_many_arguments)]
     pub fn insert_glossary_entry(
         &self,
         name_global_id: Option<i64>,
@@ -815,7 +883,6 @@ impl ProjectDb {
         english: Option<&str>,
         category: Option<&str>,
         tags: &[String],
-        aliases: &[String],
         notes: Option<&str>,
     ) -> Result<i64> {
         let now = now_iso8601();
@@ -823,15 +890,14 @@ impl ProjectDb {
             let tx = c.transaction()?;
             tx.execute(
                 "INSERT INTO glossary_entries
-                   (name_global_id, japanese, chinese, english, category, tags, aliases, notes, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                   (name_global_id, japanese, chinese, english, category, tags, notes, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
                  ON CONFLICT(japanese) DO UPDATE SET
                      name_global_id = COALESCE(excluded.name_global_id, glossary_entries.name_global_id),
                      chinese   = excluded.chinese,
                      english   = excluded.english,
                      category  = excluded.category,
                      tags      = excluded.tags,
-                     aliases   = excluded.aliases,
                      notes     = excluded.notes,
                      updated_at = excluded.updated_at",
                 rusqlite::params![
@@ -841,7 +907,6 @@ impl ProjectDb {
                     english,
                     category,
                     serde_json::to_string(tags).unwrap_or_else(|_| "[]".into()),
-                    serde_json::to_string(aliases).unwrap_or_else(|_| "[]".into()),
                     notes,
                     now,
                 ],
@@ -856,9 +921,8 @@ impl ProjectDb {
         })
     }
 
-    /// Fully edit an entry's value fields (tags/aliases replace wholesale; the
+    /// Fully edit an entry's value fields (tags replace wholesale; the
     /// `enabled` flag is untouched — use [`Self::set_entry_enabled`]).
-    #[allow(clippy::too_many_arguments)]
     pub fn update_glossary_entry(
         &self,
         id: i64,
@@ -867,22 +931,20 @@ impl ProjectDb {
         english: Option<&str>,
         category: Option<&str>,
         tags: &[String],
-        aliases: &[String],
         notes: Option<&str>,
     ) -> Result<()> {
         self.db.write(|c| {
             c.execute(
                 "UPDATE glossary_entries
                  SET japanese = ?1, chinese = ?2, english = ?3, category = ?4,
-                     tags = ?5, aliases = ?6, notes = ?7, updated_at = ?8
-                 WHERE id = ?9",
+                     tags = ?5, notes = ?6, updated_at = ?7
+                 WHERE id = ?8",
                 rusqlite::params![
                     japanese,
                     chinese,
                     english,
                     category,
                     serde_json::to_string(tags).unwrap_or_else(|_| "[]".into()),
-                    serde_json::to_string(aliases).unwrap_or_else(|_| "[]".into()),
                     notes,
                     now_iso8601(),
                     id,
@@ -922,22 +984,51 @@ impl ProjectDb {
         })
     }
 
+    /// Batch-delete entries from the project small glossary, in one statement.
+    /// Returns the number of rows actually deleted.
+    pub fn delete_glossary_entries(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.db.write(|c| {
+            let ph = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM glossary_entries WHERE id IN ({ph})");
+            Ok(c.execute(&sql, rusqlite::params_from_iter(ids.iter()))?)
+        })
+    }
+
+    /// Clear the `name_global_id` provenance pointer on small-glossary entries
+    /// whose global entry is being deleted, so no dangling cross-file reference
+    /// survives. The small-glossary data itself is kept (it is self-contained).
+    /// Returns the number of entries touched.
+    pub fn clear_global_provenance(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.db.write(|c| {
+            let ph = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+            let sql =
+                format!("UPDATE glossary_entries SET name_global_id = NULL WHERE name_global_id IN ({ph})");
+            Ok(c.execute(&sql, rusqlite::params_from_iter(ids.iter()))?)
+        })
+    }
+
     /// List the project small glossary, optionally narrowed by a free-text
     /// search across japanese/chinese/english/tags, ordered by id.
     pub fn list_glossary_entries(&self, q: Option<&str>) -> Result<Vec<GlossaryEntry>> {
         let (sql, param) = match q.map(str::trim).filter(|s| !s.is_empty()) {
             Some(pat) => (
                 "SELECT id, name_global_id, japanese, chinese, english, category, tags, enabled,
-                        aliases, notes, created_at, updated_at
+                        notes, created_at, updated_at
                  FROM glossary_entries
                  WHERE japanese LIKE ?1 OR chinese LIKE ?1 OR english LIKE ?1
-                    OR tags LIKE ?1 OR aliases LIKE ?1
+                    OR tags LIKE ?1
                  ORDER BY id",
                 format!("%{pat}%"),
             ),
             None => (
                 "SELECT id, name_global_id, japanese, chinese, english, category, tags, enabled,
-                        aliases, notes, created_at, updated_at
+                        notes, created_at, updated_at
                  FROM glossary_entries ORDER BY id",
                 String::new(),
             ),
@@ -954,13 +1045,13 @@ impl ProjectDb {
     }
 
     /// The enabled entries — exactly what translation prompt injection reads
-    /// (japanese + aliases feed the matcher; the global big glossary is never
-    /// injected directly).
+    /// (japanese feeds the matcher; the global big glossary is never injected
+    /// directly).
     pub fn matcher_entries(&self) -> Result<Vec<GlossaryEntry>> {
         self.db.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id, name_global_id, japanese, chinese, english, category, tags, enabled,
-                        aliases, notes, created_at, updated_at
+                        notes, created_at, updated_at
                  FROM glossary_entries WHERE enabled = 1 ORDER BY id",
             )?;
             let rows = stmt.query_map([], row_to_glossary_entry)?;
@@ -1239,11 +1330,10 @@ fn row_to_extracted(r: &rusqlite::Row<'_>) -> rusqlite::Result<ExtractedName> {
 }
 
 /// Map a `glossary_entries` row (column order: id, name_global_id, japanese,
-/// chinese, english, category, tags, enabled, aliases, notes, created_at,
-/// updated_at) to a [`GlossaryEntry`].
+/// chinese, english, category, tags, enabled, notes, created_at, updated_at)
+/// to a [`GlossaryEntry`].
 fn row_to_glossary_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<GlossaryEntry> {
     let tags_json: String = r.get(6)?;
-    let aliases_json: String = r.get(8)?;
     Ok(GlossaryEntry {
         id: r.get(0)?,
         name_global_id: r.get(1)?,
@@ -1253,10 +1343,9 @@ fn row_to_glossary_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<GlossaryEntr
         category: r.get(5)?,
         tags: serde_json::from_str(&tags_json).unwrap_or_default(),
         enabled: r.get::<_, i64>(7)? != 0,
-        aliases: serde_json::from_str(&aliases_json).unwrap_or_default(),
-        notes: r.get(9)?,
-        created_at: r.get(10)?,
-        updated_at: r.get(11)?,
+        notes: r.get(8)?,
+        created_at: r.get(9)?,
+        updated_at: r.get(10)?,
     })
 }
 

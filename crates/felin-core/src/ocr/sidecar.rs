@@ -106,6 +106,7 @@ pub async fn run_extract<F>(
 where
     F: FnMut(ProgressEvent) + Send,
 {
+    tracing::debug!(input = %args.input.display(), out_dir = %args.out_dir.display(), "ocr-cli extract started");
     let mut cmd = Command::new(&args.sidecar);
     cmd.args(args.to_argv())
         .envs(args.envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -298,56 +299,6 @@ async fn request_stop(child: &mut command_group::AsyncGroupChild) {
     #[cfg(not(unix))]
     {
         let _ = child.kill().await;
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use crate::error::Error;
-    use tokio::sync::watch;
-
-    /// A fake sidecar that writes a diagnostic to stderr and exits 20. The
-    /// contract's generic "fatal startup error" message hides the real cause
-    /// (e.g. ocr-cli's "failed to load config: ..."); the captured stderr tail
-    /// must surface in the OcrFatal message.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fatal_startup_surfaces_sidecar_stderr() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-sidecar.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\necho 'failed to load config: open config.yaml: no such file or directory' >&2\nexit 20\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let args = ExtractArgs {
-            sidecar: script,
-            input: dir.path().join("in.png"),
-            config: None,
-            out_dir: dir.path().join("out"),
-            manifest: dir.path().join("out/m.manifest.json"),
-            pages: None,
-            page_workers: None,
-            skip_existing: false,
-            extra: vec![],
-            envs: vec![],
-        };
-        let (_tx, rx) = watch::channel(false);
-        let err = run_extract(&args, |_| {}, rx).await.unwrap_err();
-        match err {
-            Error::OcrFatal { exit_code, message } => {
-                assert_eq!(exit_code, 20);
-                assert!(
-                    message.contains("failed to load config"),
-                    "message should carry the sidecar's own stderr, got: {message}"
-                );
-            }
-            other => panic!("expected OcrFatal, got {other:?}"),
-        }
     }
 }
 

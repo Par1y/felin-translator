@@ -17,33 +17,27 @@ pub struct Candidate {
     pub context: String,
 }
 
-/// Default name-extraction system message. Editable via `felin.toml
-/// [prompt].extract_system` (empty there → this default).
-pub const DEFAULT_EXTRACT_SYSTEM: &str = "你是日文专有名词抽取助手。从给定日文文本中抽取专有名词（人名、地名、\
-组织、作品名、独特术语等），忽略普通词汇。只输出 JSON 数组，每项形如 \
-{\"japanese\":\"原文形式\",\"guess_chinese\":\"推测中文\",\"context\":\"简短出处\"}，\
-不要输出任何其他文字。";
-
 /// Run extraction over `chapters` (each entry is a chapter's full text), using
-/// the user-configurable system message `extract_system` (empty → the built-in
-/// [`DEFAULT_EXTRACT_SYSTEM`]). Returns candidates deduplicated by normalized
-/// japanese form.
+/// the user-configurable system message `extract_system` from `felin.toml
+/// [prompt]` (the config file is the single source of truth — an empty string
+/// sends no system message, only the chapter text). Returns candidates
+/// deduplicated by normalized japanese form.
 pub async fn extract_names(
     client: &LlmClient,
     chapters: &[String],
     extract_system: &str,
 ) -> Vec<Candidate> {
-    let system = if extract_system.trim().is_empty() {
-        DEFAULT_EXTRACT_SYSTEM
-    } else {
-        extract_system
-    };
     let mut merged: BTreeMap<String, Candidate> = BTreeMap::new();
     for (i, text) in chapters.iter().enumerate() {
         if text.trim().is_empty() {
+            tracing::debug!(chapter = i, "chapter skipped (empty text)");
             continue;
         }
-        let messages = [ChatMessage::system(system), ChatMessage::user(text.clone())];
+        let messages = if extract_system.trim().is_empty() {
+            vec![ChatMessage::user(text.clone())]
+        } else {
+            vec![ChatMessage::system(extract_system), ChatMessage::user(text.clone())]
+        };
         let resp = match client.chat(&messages).await {
             Ok(r) => r,
             Err(e) => {
@@ -53,6 +47,7 @@ pub async fn extract_names(
         };
         match parse_candidates(&resp) {
             Some(list) => {
+                tracing::debug!(chapter = i, candidates = list.len(), "chapter name extraction done");
                 for c in list {
                     if c.japanese.trim().is_empty() {
                         continue;
@@ -71,25 +66,3 @@ pub fn parse_candidates(resp: &str) -> Option<Vec<Candidate>> {
     serde_json::from_value::<Vec<Candidate>>(extract_json(resp)?).ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_candidates_from_fenced_json() {
-        let resp = "```json\n[{\"japanese\":\"田中\",\"guess_chinese\":\"田中\",\"context\":\"主人公\"},\
-                    {\"japanese\":\"東京\",\"chinese\":\"东京\"}]\n```";
-        let list = parse_candidates(resp).unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].japanese, "田中");
-        assert_eq!(list[0].guess_chinese, "田中");
-        // `chinese` is accepted as an alias for `guess_chinese`.
-        assert_eq!(list[1].guess_chinese, "东京");
-        assert_eq!(list[1].context, "");
-    }
-
-    #[test]
-    fn returns_none_for_unparseable() {
-        assert!(parse_candidates("抱歉，无法输出。").is_none());
-    }
-}

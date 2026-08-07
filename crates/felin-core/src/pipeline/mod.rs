@@ -19,7 +19,7 @@
 pub mod prompt;
 mod runner;
 
-pub use prompt::{default_guidelines, glossary_block, truncate_chars};
+pub use prompt::{default_guidelines, glossary_block, tu_matched_names, truncate_chars, GlossaryMatcher};
 
 use crate::error::Result;
 use crate::llm::{LlmClient, TranslateRequest};

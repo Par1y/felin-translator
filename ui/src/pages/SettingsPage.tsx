@@ -5,15 +5,36 @@ import {
   Button,
   Card,
   Descriptions,
+  Divider,
   Input,
   InputNumber,
   Space,
   Switch,
   Tag,
   Tooltip,
+  Typography,
 } from "antd";
-import type { AppInfo, OcrConfig, OcrProviderConfig, OcrSettings, TranslationSettings } from "../types";
+import type {
+  AppInfo,
+  OcrConfig,
+  OcrProviderConfig,
+  OcrSettings,
+  PromptConfig,
+  TranslationSettings,
+} from "../types";
 import { api } from "../api";
+
+const { Text } = Typography;
+
+// Mirrors felin_core::pipeline::default_guidelines() — the project 总则 default.
+const DEFAULT_GUIDELINES = [
+  "你是日译中翻译校对助手。请把日文原文翻译成简体中文。",
+  "规则：",
+  "- 保持原文排版与空行结构，段落对应关系不变。",
+  "- 对话与引用格式保持一致。",
+  "- 称呼与敬称按中文习惯处理；专名必须使用词表译名。",
+  "- 只输出译文本身，不要任何解释、注释或额外内容。",
+].join("\n");
 
 export default function SettingsPage() {
   const { message } = AntdApp.useApp();
@@ -36,6 +57,13 @@ export default function SettingsPage() {
   const [ocrCfg, setOcrCfg] = useState<OcrConfig | null>(null);
   const [ocrCfgError, setOcrCfgError] = useState<string | null>(null);
   const [ocrCfgSaving, setOcrCfgSaving] = useState(false);
+
+  // 提示词（Prompt）：项目总则 + felin.toml [prompt] 三模板
+  const [guidelines, setGuidelinesText] = useState("");
+  const [guidelinesError, setGuidelinesError] = useState<string | null>(null);
+  const [prompt, setPrompt] = useState<PromptConfig | null>(null);
+  const [promptError, setPromptError] = useState<string | null>(null);
+  const [promptSaving, setPromptSaving] = useState(false);
 
   const loadConfig = useCallback(async () => {
     try {
@@ -63,6 +91,20 @@ export default function SettingsPage() {
         setOcrCfg(null);
         setOcrCfgError(String(e));
       });
+    api
+      .getGuidelines()
+      .then((g) => {
+        setGuidelinesText(g);
+        setGuidelinesError(null);
+      })
+      .catch(() => setGuidelinesError("未打开项目"));
+    api
+      .getPromptConfig()
+      .then((p) => {
+        setPrompt(p);
+        setPromptError(null);
+      })
+      .catch((e) => setPromptError(String(e)));
   }, [loadConfig, message]);
 
   useEffect(() => {
@@ -165,6 +207,41 @@ export default function SettingsPage() {
       message.error(`保存 OCR 配置失败：${e}`);
     } finally {
       setOcrCfgSaving(false);
+    }
+  };
+
+  // --- 提示词（Prompt） ---
+
+  const saveGuidelines = async () => {
+    try {
+      await api.setGuidelines(guidelines);
+      message.success("总则已保存");
+    } catch (e) {
+      message.error(`保存总则失败：${e}`);
+    }
+  };
+
+  const restoreGuidelines = async () => {
+    setGuidelinesText(DEFAULT_GUIDELINES);
+    try {
+      await api.setGuidelines(DEFAULT_GUIDELINES);
+      message.success("已恢复默认总则");
+    } catch (e) {
+      message.error(`恢复默认总则失败：${e}`);
+    }
+  };
+
+  const savePrompt = async () => {
+    if (!prompt) return;
+    setPromptSaving(true);
+    try {
+      await api.setPromptConfig(prompt);
+      setPromptError(null);
+      message.success("已写入 felin.toml（注释/排版保持）");
+    } catch (e) {
+      message.error(`保存提示词失败：${e}`);
+    } finally {
+      setPromptSaving(false);
     }
   };
 
@@ -302,106 +379,119 @@ export default function SettingsPage() {
           )}
           {ocrCfg && (
             <>
-              <Space direction="vertical" style={{ width: "100%" }}>
+              <Space direction="vertical" size="middle" style={{ width: "100%" }}>
                 {orderedProviders.map((p, i) => (
-                  <Space key={p.name} wrap align="center" style={{ width: "100%" }}>
-                    <Space.Compact>
-                      <Tooltip title="提前">
-                        <Button
-                          size="small"
-                          disabled={i === 0}
-                          onClick={() => move(i, -1)}
-                          aria-label="提前"
-                        >
-                          ↑
-                        </Button>
-                      </Tooltip>
-                      <Tooltip title="延后">
-                        <Button
-                          size="small"
-                          disabled={i === orderedProviders.length - 1}
-                          onClick={() => move(i, 1)}
-                          aria-label="延后"
-                        >
-                          ↓
-                        </Button>
-                      </Tooltip>
-                    </Space.Compact>
-                    <Tag>{p.name}</Tag>
-                    <Tooltip title="是否参与调用（禁用会从调用顺序中排除）">
-                      <Switch
-                        size="small"
-                        checked={p.enabled}
-                        onChange={(v) => patchProvider(p.name, { enabled: v })}
-                        checkedChildren="启用"
-                        unCheckedChildren="停用"
-                      />
-                    </Tooltip>
-                    <Input
-                      addonBefore={p.name === "browser_sse" ? "base_url" : "接口"}
-                      style={{ width: 340 }}
-                      value={p.endpoint}
-                      onChange={(e) => patchProvider(p.name, { endpoint: e.target.value })}
-                      placeholder={
-                        p.name === "browser_sse"
-                          ? "http://localhost:9222"
-                          : "https://host/v1"
-                      }
-                    />
-                    {p.name === "llm_vision" && (
+                  <Card
+                    key={p.name}
+                    size="small"
+                    style={{ width: "100%" }}
+                    title={
+                      <Space size={8}>
+                        <Tag color="blue">{i + 1}</Tag>
+                        <Text strong>{p.name}</Text>
+                      </Space>
+                    }
+                    extra={
+                      <Space size={4}>
+                        <Tooltip title="提前（调用顺序序号减小）">
+                          <Button
+                            size="small"
+                            disabled={i === 0}
+                            onClick={() => move(i, -1)}
+                            aria-label="提前"
+                          >
+                            ↑
+                          </Button>
+                        </Tooltip>
+                        <Tooltip title="延后（调用顺序序号增大）">
+                          <Button
+                            size="small"
+                            disabled={i === orderedProviders.length - 1}
+                            onClick={() => move(i, 1)}
+                            aria-label="延后"
+                          >
+                            ↓
+                          </Button>
+                        </Tooltip>
+                        <Tooltip title="是否参与调用（禁用会从调用顺序中排除）">
+                          <Switch
+                            size="small"
+                            checked={p.enabled}
+                            onChange={(v) => patchProvider(p.name, { enabled: v })}
+                            checkedChildren="启用"
+                            unCheckedChildren="停用"
+                          />
+                        </Tooltip>
+                      </Space>
+                    }
+                  >
+                    <Space direction="vertical" style={{ width: "100%" }}>
                       <Input
-                        addonBefore="模型"
-                        style={{ width: 200 }}
-                        value={p.model}
-                        onChange={(e) => patchProvider(p.name, { model: e.target.value })}
-                        placeholder="step-3.7-flash"
+                        addonBefore={p.name === "browser_sse" ? "base_url" : "接口"}
+                        value={p.endpoint}
+                        onChange={(e) => patchProvider(p.name, { endpoint: e.target.value })}
+                        placeholder={
+                          p.name === "browser_sse" ? "http://localhost:9222" : "https://host/v1"
+                        }
                       />
-                    )}
-                    {p.name !== "browser_sse" && (
-                      <Input.Password
-                        addonBefore="密钥"
-                        style={{ width: 260 }}
-                        value={p.api_key}
-                        onChange={(e) => patchProvider(p.name, { api_key: e.target.value })}
-                        placeholder="sk-... 或 ${ENV}"
-                      />
-                    )}
-                  </Space>
+                      {p.name === "llm_vision" && (
+                        <Input
+                          addonBefore="模型"
+                          value={p.model}
+                          onChange={(e) => patchProvider(p.name, { model: e.target.value })}
+                          placeholder="step-3.7-flash"
+                        />
+                      )}
+                      {p.name !== "browser_sse" && (
+                        <Input.Password
+                          addonBefore="密钥"
+                          value={p.api_key}
+                          onChange={(e) => patchProvider(p.name, { api_key: e.target.value })}
+                          placeholder="sk-... 或 ${ENV}"
+                        />
+                      )}
+                    </Space>
+                  </Card>
                 ))}
               </Space>
-              <Space direction="vertical" style={{ width: "100%" }}>
-                <Space wrap align="center">
-                  <Tag>评估阶段</Tag>
-                  <Switch
-                    size="small"
-                    checked={ocrCfg.evaluator.enabled}
-                    onChange={(v) => patchEvaluator({ enabled: v })}
-                    checkedChildren="启用"
-                    unCheckedChildren="停用"
-                  />
+
+              <Card
+                size="small"
+                title="评估阶段"
+                extra={
+                  <Tooltip title="是否启用 OCR 质量评估">
+                    <Switch
+                      size="small"
+                      checked={ocrCfg.evaluator.enabled}
+                      onChange={(v) => patchEvaluator({ enabled: v })}
+                      checkedChildren="启用"
+                      unCheckedChildren="停用"
+                    />
+                  </Tooltip>
+                }
+              >
+                <Space direction="vertical" style={{ width: "100%" }}>
                   <Input
                     addonBefore="接口"
-                    style={{ width: 340 }}
                     value={ocrCfg.evaluator.endpoint}
                     onChange={(e) => patchEvaluator({ endpoint: e.target.value })}
                     placeholder="https://host/v1"
                   />
                   <Input
                     addonBefore="模型"
-                    style={{ width: 200 }}
                     value={ocrCfg.evaluator.model}
                     onChange={(e) => patchEvaluator({ model: e.target.value })}
                     placeholder="step-3.7-flash"
                   />
                   <Input.Password
                     addonBefore="密钥"
-                    style={{ width: 260 }}
                     value={ocrCfg.evaluator.api_key}
                     onChange={(e) => patchEvaluator({ api_key: e.target.value })}
                     placeholder="sk-... 或 ${ENV}"
                   />
                 </Space>
-              </Space>
+              </Card>
+
               <Space>
                 <Button type="primary" loading={ocrCfgSaving} disabled={disabled} onClick={saveOcrCfg}>
                   保存 OCR 配置
@@ -421,6 +511,96 @@ export default function SettingsPage() {
                 </Button>
               </Space>
             </>
+          )}
+        </Space>
+      </Card>
+
+      <Card title="提示词（Prompt）">
+        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+          <Text type="secondary">
+            翻译总则（项目级，存于项目数据库）—— 作为 {"{guidelines}"} 占位符注入翻译 system 模板
+          </Text>
+          {guidelinesError ? (
+            <Alert
+              type="warning"
+              showIcon
+              message={guidelinesError}
+              description="翻译总则按项目保存，需要先打开一个项目后再编辑。"
+            />
+          ) : (
+            <Space direction="vertical" style={{ width: "100%" }}>
+              <Input.TextArea
+                value={guidelines}
+                onChange={(e) => setGuidelinesText(e.target.value)}
+                rows={4}
+                placeholder="项目翻译总则…"
+              />
+              <Space>
+                <Button type="primary" onClick={saveGuidelines}>
+                  保存总则
+                </Button>
+                <Button onClick={restoreGuidelines}>恢复默认</Button>
+              </Space>
+            </Space>
+          )}
+
+          <Divider plain style={{ margin: "8px 0" }}>
+            Prompt 模板（felin.toml [prompt]，保存后立即生效）
+          </Divider>
+
+          {promptError && (
+            <Alert type="error" showIcon message="无法读取提示词配置" description={promptError} />
+          )}
+          {prompt && (
+            <Space direction="vertical" style={{ width: "100%" }}>
+              <Text type="secondary">
+                专名抽取 Prompt（extract_system）—— 留空 = 不发送 system 消息
+              </Text>
+              <Input.TextArea
+                value={prompt.extract_system}
+                onChange={(e) => setPrompt({ ...prompt, extract_system: e.target.value })}
+                rows={3}
+                placeholder="专名抽取 system 消息，例如“从给定日文文本中抽取专有名词…”"
+              />
+              <Text type="secondary">
+                翻译 System 模板（translation_system）—— 占位符：{"{guidelines}"} /{" "}
+                {"{instruction}"} / {"{glossary}"}；留空 = 不发送 system 消息
+              </Text>
+              <Input.TextArea
+                value={prompt.translation_system}
+                onChange={(e) => setPrompt({ ...prompt, translation_system: e.target.value })}
+                rows={4}
+                placeholder={`{guidelines}\n\n附加要求（优先级高于总则）：{instruction}\n\n专名参考（词表，必须使用）：{glossary}`}
+              />
+              <Text type="secondary">
+                翻译 User 模板（translation_user）—— 占位符：{"{context}"} / {"{source}"}；
+                留空 = 只发送原文
+              </Text>
+              <Input.TextArea
+                value={prompt.translation_user}
+                onChange={(e) => setPrompt({ ...prompt, translation_user: e.target.value })}
+                rows={4}
+                placeholder={`【上文参考（已校对，仅供风格与称谓参考，勿重复翻译）】\n{context}\n\n【待翻译原文】\n{source}`}
+              />
+              <Space>
+                <Button type="primary" loading={promptSaving} onClick={savePrompt}>
+                  保存 Prompt
+                </Button>
+                <Button
+                  onClick={() =>
+                    api
+                      .getPromptConfig()
+                      .then((p) => {
+                        setPrompt(p);
+                        setPromptError(null);
+                      })
+                      .catch((e) => setPromptError(String(e)))
+                  }
+                >
+                  重新读取
+                </Button>
+              </Space>
+            </Space>
           )}
         </Space>
       </Card>
