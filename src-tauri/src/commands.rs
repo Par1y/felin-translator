@@ -87,10 +87,17 @@ pub struct TxtImportResult {
 
 #[derive(Serialize, Clone)]
 pub struct ExportResult {
+    pub task_id: String,
     pub archive: String,
     pub sha256: String,
     pub bytes: u64,
     pub files: usize,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ExportProgressPayload {
+    pub task_id: String,
+    pub event: felin_core::archive::ArchiveProgress,
 }
 
 #[derive(Serialize, Clone)]
@@ -1301,6 +1308,16 @@ fn stage_images(files: &[PathBuf], staged_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Removes a directory on drop — used to guarantee the OCR batch staging dir
+/// (`inputs/`, symlinks to the user's source images) is cleaned up on every
+/// exit path, never left behind.
+struct CleanupDir(PathBuf);
+impl Drop for CleanupDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Import the images in `dir` that match `rule` via the `ocr-cli batch`
 /// sidecar. Returns a `task_id` immediately; progress arrives over the same
 /// `ocr://progress` / `ocr://done` / `ocr://error` events as [`import_ocr`],
@@ -1465,6 +1482,10 @@ async fn run_batch_import(
     let mut ok: usize = 0;
     let mut failed: usize = 0;
     let mut failed_pages: Vec<i64> = Vec::new();
+    // RAII: the batch staging dir (`inputs/`, symlinks to the user's source
+    // images) is transient — remove it on every exit path (success, error,
+    // cancellation, panic), never keep the source inputs around.
+    let _inputs_guard = CleanupDir(args.input_dir.clone());
     // A clone of the cancel flag outlives `run_batch` (which consumes `rx`),
     // so after the run we can tell a cancellation from normal completion.
     let cancel_probe = rx.clone();
@@ -1530,6 +1551,7 @@ async fn run_batch_import(
 
     // The staging inputs were only for `batch`; remove them now that the txts
     // are ingested (the txt/json outputs in `out_dir` are kept like `extract`).
+    // `CleanupDir` also covers the error/cancel/panic exit paths.
     let _ = std::fs::remove_dir_all(&args.input_dir);
 
     Ok(ImportResult {
@@ -1549,21 +1571,67 @@ async fn run_batch_import(
 /// `dest_path` (a location the user picks — e.g. next to their source files),
 /// with a SHA-256 digest for integrity. Lets a project be moved/backed up even
 /// though its data normally lives next to the software.
+///
+/// Returns a `task_id` immediately; the pack runs on a background thread so the
+/// UI isn't blocked. Progress arrives via `export://progress`, completion via
+/// `export://done`, and failures via `export://error` (same pattern as OCR
+/// import).
 #[tauri::command]
-pub fn export_project(state: State<'_, AppState>, dest_path: String) -> Result<ExportResult, String> {
+pub fn export_project(app: AppHandle, state: State<'_, AppState>, dest_path: String) -> Result<ExportResult, String> {
     let (root, slug) = {
         let guard = state.project_guard();
         let p = guard.as_ref().ok_or_else(|| "no project is open".to_string())?;
         (p.root.clone(), p.slug.clone())
     };
     let dest = PathBuf::from(&dest_path);
-    let out = archive::export_project(&root, &slug, &dest).map_err(|e| e.to_string())?;
-    Ok(ExportResult {
-        archive: dest.display().to_string(),
-        sha256: out.sha256,
-        bytes: out.bytes,
-        files: out.files,
-    })
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let app_thread = app.clone();
+    let tid = task_id.clone();
+    let tid_prog = task_id.clone();
+    let dest_thread = dest.clone();
+    let dest_display = dest.display().to_string();
+    let dest_display_ret = dest_display.clone();
+    std::thread::spawn(move || {
+        // The pack is blocking (compress + hash); run it on a plain OS thread.
+        // No dedicated runtime needed — no async I/O happens here.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            archive::export_project(&root, &slug, &dest_thread, Some(|ev| {
+                let _ = app_thread.emit(
+                    "export://progress",
+                    ExportProgressPayload { task_id: tid_prog.clone(), event: ev },
+                );
+            }))
+        }));
+        match result {
+            Ok(Ok(out)) => {
+                let _ = app_thread.emit(
+                    "export://done",
+                    ExportResult {
+                        task_id: tid.clone(),
+                        archive: dest_display.clone(),
+                        sha256: out.sha256,
+                        bytes: out.bytes,
+                        files: out.files,
+                    },
+                );
+            }
+            Ok(Err(e)) => {
+                let _ = app_thread.emit(
+                    "export://error",
+                    ErrorPayload { task_id: tid.clone(), message: e.to_string() },
+                );
+            }
+            Err(_) => {
+                let _ = app_thread.emit(
+                    "export://error",
+                    ErrorPayload { task_id: tid.clone(), message: "export task panicked".into() },
+                );
+            }
+        }
+    });
+
+    Ok(ExportResult { task_id, archive: dest_display_ret, sha256: String::new(), bytes: 0, files: 0 })
 }
 
 /// Import a project archive into the app-side projects dir (verifying every

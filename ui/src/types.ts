@@ -51,10 +51,21 @@ export interface TxtImportResult {
 }
 
 export interface ExportResult {
+  task_id: string;
   archive: string;
   sha256: string;
   bytes: number;
   files: number;
+}
+
+// Mirrors felin_core::archive::ArchiveProgress (tagged by "event").
+export type ArchiveProgressEvent =
+  | { event: "start"; total_files: number }
+  | { event: "progress"; done: number; total_files: number };
+
+export interface ExportProgressPayload {
+  task_id: string;
+  event: ArchiveProgressEvent;
 }
 
 export interface Tu {

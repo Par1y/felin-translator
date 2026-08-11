@@ -298,10 +298,7 @@ impl TechConfig {
     pub fn default_template() -> String {
         let base = format!(
             r#"# Felin Translator 技术参数配置（felin.toml）
-#
-# 本文件由应用首次启动时自动生成（数据目录，见 PROGRESS §5）。技术参数在此编辑，
-# 非技术选项（模型/密钥/并发等）在 GUI 里设置。删除后重启会按本模板重新生成。
-# 所有字段都可省略 —— 省略即用内置默认值。
+# 如果你不知道该文件内容的具体含义，不要修改该文件。
 
 [seg]
 default_block_size = 3000
@@ -331,11 +328,11 @@ max_delay_secs = 30
 [sidecar]
 cancel_grace_secs = 8
 poll_ms = 150
-# OCR 后端（ocr-cli）二进制与 provider 配置文件由用户管理，填绝对路径即生效：
+# OCR 后端（ocr-cli）二进制与 provider 配置文件：
 #   bin    = "/path/to/ocr-router/bin/ocr-cli"
 #   config = "/path/to/ocr-router/config.yaml"   # 含 provider 密钥
 # 两者留空（默认）时依次退回环境变量 FELIN_SIDECAR / FELIN_SIDECAR_CONFIG，
-# 再缺省时打包版找可执行文件旁的 ocr-cli / config.yaml；找不到会在导入时报错。
+# 或打包版本可执行文件旁的 ocr-cli / config.yaml。
 
 [pipeline]
 queue_capacity = 64
@@ -362,11 +359,11 @@ enabled = false
         // with the comment header. Values come from `factory_prompt_config()`,
         // NOT `PromptConfig::default()` (which is empty by design).
         format!(
-            "{base}\n# 提示词模板 —— 发送给 LLM 的 prompt 文本完全由本节配置（代码内无默认文本）。\n\
+            "{base}\n# 提示词模板 —— 发送给 LLM 的 prompt。\n\
              # 翻译 System 占位符 {{guidelines}} {{instruction}} {{glossary}}；\n\
              # 翻译 User 占位符 {{context}} {{source}}。\n\
              # 某字段留空（\"\"）即不发送该消息段。可在设置页「提示词」编辑\n\
-             # （保存后立即生效，无需重启）；也可直接改本文件（重启生效）。\n\
+             # （GUI 保存后立即生效，无需重启）；也可直接改本文件（重启生效）。\n\
              {}",
             prompt_block()
         )

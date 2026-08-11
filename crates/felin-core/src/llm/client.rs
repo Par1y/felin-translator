@@ -170,7 +170,7 @@ impl LlmClient {
             // /chat/completions (as ocr-router's config uses); a wrong model
             // name or an account without that model also 404s here.
             detail.push_str(
-                "（endpoint 可能多写了一层 /chat/completions，应填 https://host/v1 或完整 URL；\
+                "（endpoint URI错误；\
                  或模型名/路径不对，账号无权访问该模型）",
             );
         }

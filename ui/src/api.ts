@@ -7,6 +7,7 @@ import type {
   CsvMapping,
   CsvPreviewRow,
   ErrorPayload,
+  ExportProgressPayload,
   ExportResult,
   ExtractedName,
   FileSelection,
@@ -149,6 +150,20 @@ export function onOcrDone(cb: (r: ImportResult) => void): Promise<UnlistenFn> {
 
 export function onOcrError(cb: (e: ErrorPayload) => void): Promise<UnlistenFn> {
   return listen<ErrorPayload>("ocr://error", (e) => cb(e.payload));
+}
+
+export function onExportProgress(
+  cb: (p: ExportProgressPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<ExportProgressPayload>("export://progress", (e) => cb(e.payload));
+}
+
+export function onExportDone(cb: (r: ExportResult) => void): Promise<UnlistenFn> {
+  return listen<ExportResult>("export://done", (e) => cb(e.payload));
+}
+
+export function onExportError(cb: (e: ErrorPayload) => void): Promise<UnlistenFn> {
+  return listen<ErrorPayload>("export://error", (e) => cb(e.payload));
 }
 
 export function onTranslationProgress(

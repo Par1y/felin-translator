@@ -1,15 +1,21 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   App as AntdApp,
   Alert,
   Button,
   Card,
   Input,
+  Progress,
   Space,
   Typography,
 } from "antd";
-import type { ExportResult, TranslationExport } from "../types";
-import { api } from "../api";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import type {
+  ExportProgressPayload,
+  ExportResult,
+  TranslationExport,
+} from "../types";
+import { api, onExportDone, onExportError, onExportProgress } from "../api";
 import { pickDirectory, pickSavePath } from "../dialog";
 
 export default function ExportPage() {
@@ -17,24 +23,61 @@ export default function ExportPage() {
   const [dest, setDest] = useState("");
   const [result, setResult] = useState<ExportResult | null>(null);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [txDir, setTxDir] = useState("");
   const [txResult, setTxResult] = useState<TranslationExport | null>(null);
   const [txBusy, setTxBusy] = useState(false);
+
+  const taskRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const subs: Promise<UnlistenFn>[] = [
+      onExportProgress((p: ExportProgressPayload) => {
+        if (p.task_id !== taskRef.current) return;
+        const ev = p.event;
+        if (ev.event === "start") setProgress(null);
+        else if (ev.event === "progress")
+          setProgress({ done: ev.done, total: ev.total_files });
+      }),
+      onExportDone((r) => {
+        if (r.task_id !== taskRef.current) return;
+        taskRef.current = null;
+        setBusy(false);
+        setProgress(null);
+        setResult(r);
+        message.success("项目已导出");
+      }),
+      onExportError((e) => {
+        if (e.task_id !== taskRef.current) return;
+        taskRef.current = null;
+        setBusy(false);
+        setProgress(null);
+        message.error(`导出失败：${e.message}`);
+      }),
+    ];
+    return () => {
+      subs.forEach((u) => void u.then((f) => f()));
+    };
+  }, [message]);
 
   const doExport = async () => {
     if (!dest.trim()) {
       message.warning("请输入导出归档的路径");
       return;
     }
+    setResult(null);
+    setProgress(null);
     setBusy(true);
     try {
       const r = await api.exportProject(dest.trim());
-      setResult(r);
-      message.success("项目已导出");
+      taskRef.current = r.task_id;
     } catch (e) {
-      message.error(String(e));
-    } finally {
+      taskRef.current = null;
       setBusy(false);
+      message.error(String(e));
     }
   };
 
@@ -54,6 +97,11 @@ export default function ExportPage() {
       setTxBusy(false);
     }
   };
+
+  const percent =
+    progress && progress.total > 0
+      ? Math.round((progress.done / progress.total) * 100)
+      : 0;
 
   return (
     <Space
@@ -109,7 +157,7 @@ export default function ExportPage() {
         </Space>
       </Card>
 
-      {/* 项目归档：单个压缩包 + SHA-256，携带项目小词库。 */}
+      {/* 项目归档：单个压缩包 + 内嵌 SHA-256，携带项目小词库。 */}
       <Card title="导出项目">
         <Space direction="vertical" style={{ width: "100%" }}>
           <Space.Compact style={{ width: "100%" }}>
@@ -136,6 +184,15 @@ export default function ExportPage() {
           <Button type="primary" loading={busy} onClick={doExport}>
             导出当前项目
           </Button>
+          {busy && (
+            <Progress
+              percent={percent}
+              status={busy ? "active" : "normal"}
+              format={() =>
+                progress ? `${progress.done}/${progress.total}` : "准备中…"
+              }
+            />
+          )}
           {result && (
             <Alert
               type="success"
@@ -159,7 +216,8 @@ export default function ExportPage() {
             />
           )}
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-            只导出项目数据（含项目小词库），不含源文件与全局大词库。
+            只导出项目数据（含项目小词库），不含源文件与全局大词库；SHA-256
+            校验和已打包在压缩包内部。
           </Typography.Paragraph>
         </Space>
       </Card>
