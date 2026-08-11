@@ -17,14 +17,9 @@ import {
   Tooltip,
   Typography,
 } from "antd";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { Chapter, TuWithTranslation } from "../types";
-import {
-  api,
-  onTranslationDone,
-  onTranslationError,
-  onTranslationProgress,
-} from "../api";
+import { api } from "../api";
+import { useTasks } from "../tasks";
 
 /// TU state → friendly 中文 label + tag color for the proofreading cards.
 function tuStatusView(s: string): { text: string; color: string } {
@@ -158,7 +153,7 @@ function TuCard({
             type="secondary"
             style={{ display: "block", marginBottom: 4 }}
           >
-            原文（可改，留空恢复段落原文）
+            原文
           </Typography.Text>
           <Input.TextArea
             value={source}
@@ -203,7 +198,7 @@ function TuCard({
             type="secondary"
             style={{ display: "block", marginBottom: 4 }}
           >
-            译文（可改）
+            译文
           </Typography.Text>
           <Input.TextArea
             value={trans}
@@ -232,6 +227,7 @@ function TuCard({
 
 export default function ReviewPage() {
   const { message } = AntdApp.useApp();
+  const { translation, translationStart, translationSync, translationStop } = useTasks();
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [chapterId, setChapterId] = useState<number | null>(null);
   const [segmenting, setSegmenting] = useState(false);
@@ -239,23 +235,14 @@ export default function ReviewPage() {
   const [group, setGroup] = useState<string>("all");
 
   // Translation section state.
-  const [running, setRunning] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [taskId, setTaskId] = useState<string | null>(null);
-  const [counts, setCounts] = useState<{ status: string; count: number }[]>([]);
-  const [activeChapters, setActiveChapters] = useState<number[]>([]);
   const [tuRows, setTuRows] = useState<TuWithTranslation[]>([]);
   /// Batch-selection set — the shared checkbox drives both 重译所选 and 删除所选
   /// (both buttons live in the 翻译 bar above).
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [retranslateModal, setRetranslateModal] = useState(false);
   const [retranslateInstr, setRetranslateInstr] = useState("");
-  const taskRef = useRef<string | null>(null);
   const chapterIdRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    taskRef.current = taskId;
-  }, [taskId]);
 
   useEffect(() => {
     chapterIdRef.current = chapterId;
@@ -301,12 +288,7 @@ export default function ReviewPage() {
   /// activation window) and the selected chapter's TU list.
   const refreshTranslation = useCallback(async () => {
     try {
-      const st = await api.translationStatus();
-      setRunning(st.running);
-      setTaskId(st.task_id);
-      taskRef.current = st.task_id;
-      setCounts(st.counts);
-      setActiveChapters(st.active_chapters);
+      translationSync(await api.translationStatus());
     } catch {
       // no project open (page reachable right after a close) — leave as-is
     }
@@ -314,46 +296,14 @@ export default function ReviewPage() {
     if (cid != null) {
       await loadTus(cid);
     }
-  }, [loadTus]);
+  }, [translationSync, loadTus]);
 
+  // Pipeline events arrive in the global store; this page re-syncs status and
+  // reloads the current chapter's TU rows whenever the store's revision bumps
+  // (also runs once on mount to reconcile a run started on another page).
   useEffect(() => {
     void refreshTranslation();
-  }, [refreshTranslation]);
-
-  // Live pipeline events: refresh status/TU list when anything moves.
-  useEffect(() => {
-    const subs: Promise<UnlistenFn>[] = [
-      onTranslationProgress((p) => {
-        if (taskRef.current != null && p.task_id !== taskRef.current) return;
-        const ev = p.event;
-        if (
-          ev.event === "tu_done" ||
-          ev.event === "tu_failed" ||
-          ev.event === "finished" ||
-          ev.event === "stopped"
-        ) {
-          void refreshTranslation();
-        }
-      }),
-      onTranslationDone((r) => {
-        if (r.task_id !== taskRef.current) return;
-        setTaskId(null);
-        taskRef.current = null;
-        message.success("翻译完成");
-        void refreshTranslation();
-      }),
-      onTranslationError((e) => {
-        if (e.task_id !== taskRef.current) return;
-        setTaskId(null);
-        taskRef.current = null;
-        message.error(`翻译出错：${e.message}`);
-        void refreshTranslation();
-      }),
-    ];
-    return () => {
-      subs.forEach((u) => void u.then((f) => f()));
-    };
-  }, [message, refreshTranslation]);
+  }, [translation.revision, refreshTranslation]);
 
   const segment = async () => {
     setSegmenting(true);
@@ -372,23 +322,12 @@ export default function ReviewPage() {
     setStarting(true);
     try {
       const tid = await api.startTranslation();
-      setTaskId(tid);
-      taskRef.current = tid;
-      setRunning(true);
+      translationStart(tid);
       void refreshTranslation();
     } catch (e) {
       message.error(String(e));
     } finally {
       setStarting(false);
-    }
-  };
-
-  const stop = async () => {
-    try {
-      await api.stopTranslation();
-      message.info("已请求停止");
-    } catch (e) {
-      message.error(String(e));
     }
   };
 
@@ -446,7 +385,7 @@ export default function ReviewPage() {
     groupStates.length === 0
       ? tuRows
       : tuRows.filter((t) => groupStates.includes(t.status));
-  const totalCount = counts.reduce((a, c) => a + c.count, 0);
+  const totalCount = translation.counts.reduce((a, c) => a + c.count, 0);
   // Batch-selection state against the currently-shown TU cards.
   const selectedShown = shown.filter((t) => selectedIds.has(t.id)).length;
   const allShownSelected = shown.length > 0 && selectedShown === shown.length;
@@ -503,15 +442,15 @@ export default function ReviewPage() {
             <Button
               type="primary"
               loading={starting}
-              disabled={running}
+              disabled={translation.running}
               onClick={start}
             >
               全部翻译
             </Button>
-            <Button danger disabled={!running} onClick={stop}>
+            <Button danger disabled={!translation.running} onClick={translationStop}>
               停止
             </Button>
-            <Button disabled={running} onClick={retryAll}>
+            <Button disabled={translation.running} onClick={retryAll}>
               重试失败项
             </Button>
             <Button
@@ -537,16 +476,16 @@ export default function ReviewPage() {
         }
       >
         <Space wrap>
-          {running ? <Tag color="processing">运行中</Tag> : <Tag>未运行</Tag>}
-          {activeChapters.length > 0 && (
-            <Tag>激活章：{activeChapters.join(", ")}</Tag>
+          {translation.running ? <Tag color="processing">运行中</Tag> : <Tag>未运行</Tag>}
+          {translation.activeChapters.length > 0 && (
+            <Tag>激活章：{translation.activeChapters.join(", ")}</Tag>
           )}
           {totalCount > 0 && (
             <Typography.Text type="secondary">
               共 {totalCount} 条
             </Typography.Text>
           )}
-          {counts.map((c) => (
+          {translation.counts.map((c) => (
             <Tag key={c.status} color={tuStatusView(c.status).color}>
               {tuStatusView(c.status).text}: {c.count}
             </Tag>

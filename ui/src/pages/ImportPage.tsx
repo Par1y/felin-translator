@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   App as AntdApp,
   Button,
@@ -16,18 +16,16 @@ import {
   Typography,
   type TableProps,
 } from "antd";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
   CsvMapping,
   CsvPreviewRow,
   ExtractedName,
   FileSelection,
   ImageMatchRule,
-  ImportResult,
-  ProgressPayload,
 } from "../types";
 import { DEFAULT_IMAGE_RULE } from "../types";
-import { api, onOcrDone, onOcrError, onOcrProgress } from "../api";
+import { api } from "../api";
+import { useTasks } from "../tasks";
 import { pickDirectory, pickFile } from "../dialog";
 
 /// Confirmation target for extracted candidates / CSV rows.
@@ -68,7 +66,7 @@ const TAG_OPTIONS = [
 
 export default function ImportPage() {
   const { message } = AntdApp.useApp();
-  const taskRef = useRef<string | null>(null);
+  const { ocr, ocrStart, ocrCancel } = useTasks();
 
   // ---- ① 文本导入 (txt/md) ------------------------------------------------
   const [txtPath, setTxtPath] = useState("");
@@ -81,13 +79,6 @@ export default function ImportPage() {
   const [rule, setRule] = useState<ImageMatchRule>({ ...DEFAULT_IMAGE_RULE });
   const [selection, setSelection] = useState<FileSelection | null>(null);
   const [scanning, setScanning] = useState(false);
-  const [taskId, setTaskId] = useState<string | null>(null);
-  const [progress, setProgress] = useState<{
-    done: number;
-    total: number;
-  } | null>(null);
-  const [log, setLog] = useState<string[]>([]);
-  const [result, setResult] = useState<ImportResult | null>(null);
 
   // ---- ③ 专名抽取与校对 ----------------------------------------------------
   const [extracting, setExtracting] = useState(false);
@@ -204,47 +195,6 @@ export default function ImportPage() {
     return () => clearTimeout(t);
   }, [csvPath, csvHeaders, csvMap, hasHeader]);
 
-  useEffect(() => {
-    taskRef.current = taskId;
-  }, [taskId]);
-
-  useEffect(() => {
-    const subs: Promise<UnlistenFn>[] = [
-      onOcrProgress((p: ProgressPayload) => {
-        if (p.task_id !== taskRef.current) return;
-        const ev = p.event;
-        if (ev.event === "start")
-          setLog((l) => [...l, `开始：共 ${ev.pages_total} 项`]);
-        else if (ev.event === "page") {
-          setProgress({ done: ev.done, total: ev.total });
-          setLog((l) => [
-            ...l,
-            `第 ${ev.page} 项：${ev.status}${ev.error ? ` (${ev.error})` : ""}`,
-          ]);
-        } else if (ev.event === "done") {
-          setLog((l) => [
-            ...l,
-            `完成：${ev.pages_ok} 成功 / ${ev.pages_failed} 失败`,
-          ]);
-        }
-      }),
-      onOcrDone((r) => {
-        if (r.task_id !== taskRef.current) return;
-        setResult(r);
-        setTaskId(null);
-        message.success(`导入完成：${r.paragraphs} 段落`);
-      }),
-      onOcrError((e) => {
-        if (e.task_id !== taskRef.current) return;
-        setTaskId(null);
-        message.error(`导入失败：${e.message}`);
-      }),
-    ];
-    return () => {
-      subs.forEach((u) => void u.then((f) => f()));
-    };
-  }, [message]);
-
   const importTxt = async () => {
     if (!txtPath.trim()) {
       message.warning("请输入文本文件路径");
@@ -263,11 +213,8 @@ export default function ImportPage() {
       message.warning("请输入 PDF / 图片文件路径");
       return;
     }
-    setResult(null);
-    setLog([]);
-    setProgress(null);
     try {
-      setTaskId(await api.importOcr(pdfPath.trim(), pages.trim() || undefined));
+      ocrStart(await api.importOcr(pdfPath.trim(), pages.trim() || undefined));
     } catch (e) {
       message.error(String(e));
     }
@@ -298,21 +245,8 @@ export default function ImportPage() {
       message.warning("请先扫描确认有匹配的图片");
       return;
     }
-    setResult(null);
-    setLog([]);
-    setProgress(null);
     try {
-      setTaskId(await api.importImagesBatch(imgDir.trim(), rule));
-    } catch (e) {
-      message.error(String(e));
-    }
-  };
-
-  const cancel = async () => {
-    if (!taskId) return;
-    try {
-      await api.cancelImport(taskId);
-      message.info("已请求取消");
+      ocrStart(await api.importImagesBatch(imgDir.trim(), rule));
     } catch (e) {
       message.error(String(e));
     }
@@ -676,7 +610,7 @@ export default function ImportPage() {
                 onChange={(e) => setPages(e.target.value)}
               />
               <Space>
-                <Button type="primary" onClick={startPdf} disabled={!!taskId}>
+                <Button type="primary" onClick={startPdf} disabled={!!ocr.taskId}>
                   开始 OCR
                 </Button>
               </Space>
@@ -780,7 +714,7 @@ export default function ImportPage() {
                 <Button
                   type="primary"
                   onClick={startBatch}
-                  disabled={!!taskId || !selection || selection.matched === 0}
+                  disabled={!!ocr.taskId || !selection || selection.matched === 0}
                 >
                   导入 {selection?.matched ?? 0} 张图片
                 </Button>
@@ -796,27 +730,27 @@ export default function ImportPage() {
 
           {/* 共享的导入进度 / 日志 / 取消 */}
           <Space>
-            <Button danger onClick={cancel} disabled={!taskId}>
+            <Button danger onClick={() => void ocrCancel()} disabled={!ocr.taskId}>
               取消
             </Button>
           </Space>
-          {progress && (
+          {ocr.progress && (
             <Progress
               percent={
-                progress.total
-                  ? Math.round((progress.done / progress.total) * 100)
+                ocr.progress.total
+                  ? Math.round((ocr.progress.done / ocr.progress.total) * 100)
                   : 0
               }
-              status={taskId ? "active" : "normal"}
+              status={ocr.taskId ? "active" : "normal"}
             />
           )}
-          {result && (
-            <Tag color={outcomeColor(result.outcome)}>
-              结果：{result.outcome}，{result.paragraphs} 段落，失败项 [
-              {result.failed_pages.join(", ")}]
+          {ocr.result && (
+            <Tag color={outcomeColor(ocr.result.outcome)}>
+              结果：{ocr.result.outcome}，{ocr.result.paragraphs} 段落，失败项 [
+              {ocr.result.failed_pages.join(", ")}]
             </Tag>
           )}
-          {log.length > 0 && (
+          {ocr.log.length > 0 && (
             <Card
               size="small"
               styles={{
@@ -828,7 +762,7 @@ export default function ImportPage() {
                 },
               }}
             >
-              {log.map((l, i) => (
+              {ocr.log.map((l, i) => (
                 <div key={i}>{l}</div>
               ))}
             </Card>

@@ -143,7 +143,13 @@ where
                         break;
                     }
                 }
-                Err(e) => tracing::warn!(line = t, error = %e, "unparseable progress line"),
+                // The real ocr-cli interleaves JSON *log* lines (its logger
+                // writes `ocr_result` / `quality_check` / `quality_passed` to
+                // stdout when `logging.format: json`) with the progress stream.
+                // They carry no progress and must not spam warnings — skip
+                // them, mirroring how `batch` tolerates non-progress lines
+                // (`parse_batch_line` → `None`).
+                Err(_) => {}
             }
         }
     });

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   App as AntdApp,
   Alert,
@@ -9,74 +9,29 @@ import {
   Space,
   Typography,
 } from "antd";
-import type { UnlistenFn } from "@tauri-apps/api/event";
-import type {
-  ExportProgressPayload,
-  ExportResult,
-  TranslationExport,
-} from "../types";
-import { api, onExportDone, onExportError, onExportProgress } from "../api";
+import type { TranslationExport } from "../types";
+import { api } from "../api";
+import { useTasks } from "../tasks";
 import { pickDirectory, pickSavePath } from "../dialog";
 
 export default function ExportPage() {
   const { message } = AntdApp.useApp();
+  const { exportTask, exportStart, exportClear } = useTasks();
   const [dest, setDest] = useState("");
-  const [result, setResult] = useState<ExportResult | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState<{
-    done: number;
-    total: number;
-  } | null>(null);
   const [txDir, setTxDir] = useState("");
   const [txResult, setTxResult] = useState<TranslationExport | null>(null);
   const [txBusy, setTxBusy] = useState(false);
-
-  const taskRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    const subs: Promise<UnlistenFn>[] = [
-      onExportProgress((p: ExportProgressPayload) => {
-        if (p.task_id !== taskRef.current) return;
-        const ev = p.event;
-        if (ev.event === "start") setProgress(null);
-        else if (ev.event === "progress")
-          setProgress({ done: ev.done, total: ev.total_files });
-      }),
-      onExportDone((r) => {
-        if (r.task_id !== taskRef.current) return;
-        taskRef.current = null;
-        setBusy(false);
-        setProgress(null);
-        setResult(r);
-        message.success("项目已导出");
-      }),
-      onExportError((e) => {
-        if (e.task_id !== taskRef.current) return;
-        taskRef.current = null;
-        setBusy(false);
-        setProgress(null);
-        message.error(`导出失败：${e.message}`);
-      }),
-    ];
-    return () => {
-      subs.forEach((u) => void u.then((f) => f()));
-    };
-  }, [message]);
 
   const doExport = async () => {
     if (!dest.trim()) {
       message.warning("请输入导出归档的路径");
       return;
     }
-    setResult(null);
-    setProgress(null);
-    setBusy(true);
     try {
       const r = await api.exportProject(dest.trim());
-      taskRef.current = r.task_id;
+      exportStart(r.task_id);
     } catch (e) {
-      taskRef.current = null;
-      setBusy(false);
+      exportClear();
       message.error(String(e));
     }
   };
@@ -99,8 +54,8 @@ export default function ExportPage() {
   };
 
   const percent =
-    progress && progress.total > 0
-      ? Math.round((progress.done / progress.total) * 100)
+    exportTask.progress && exportTask.progress.total > 0
+      ? Math.round((exportTask.progress.done / exportTask.progress.total) * 100)
       : 0;
 
   return (
@@ -181,19 +136,21 @@ export default function ExportPage() {
               选择…
             </Button>
           </Space.Compact>
-          <Button type="primary" loading={busy} onClick={doExport}>
+          <Button type="primary" loading={exportTask.busy} onClick={doExport}>
             导出当前项目
           </Button>
-          {busy && (
+          {exportTask.busy && (
             <Progress
               percent={percent}
-              status={busy ? "active" : "normal"}
+              status={exportTask.busy ? "active" : "normal"}
               format={() =>
-                progress ? `${progress.done}/${progress.total}` : "准备中…"
+                exportTask.progress
+                  ? `${exportTask.progress.done}/${exportTask.progress.total}`
+                  : "准备中…"
               }
             />
           )}
-          {result && (
+          {exportTask.result && (
             <Alert
               type="success"
               showIcon
@@ -206,11 +163,12 @@ export default function ExportPage() {
                     wordBreak: "break-all",
                   }}
                 >
-                  <div>文件：{result.archive}</div>
+                  <div>文件：{exportTask.result.archive}</div>
                   <div>
-                    大小：{result.bytes} 字节，共 {result.files} 个文件
+                    大小：{exportTask.result.bytes} 字节，共 {exportTask.result.files}{" "}
+                    个文件
                   </div>
-                  <div>SHA-256：{result.sha256}</div>
+                  <div>SHA-256：{exportTask.result.sha256}</div>
                 </div>
               }
             />
