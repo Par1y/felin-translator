@@ -145,7 +145,7 @@ async fn fatal_404_carries_endpoint_hint() {
     let client = LlmClient::new(cfg(server.uri())).unwrap();
     let err = client.chat(&[ChatMessage::user("hi")]).await.unwrap_err();
     let felin_core::Error::Llm { detail } = err else { panic!("expected Llm error") };
-    assert!(detail.contains("/chat/completions"), "hint should mention endpoint format: {detail}");
+    assert!(detail.contains("endpoint URI错误"), "hint should mention endpoint format: {detail}");
     assert_eq!(server.received_requests().await.unwrap().len(), 1, "404 is fatal, no retry");
 }
 

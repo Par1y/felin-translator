@@ -2,8 +2,10 @@ name: build
 
 on:
   push:
-    branches: [main, master]
-    tags: ['v*']
+    # Build ONLY on semver tags (v1.2.3 / v1.2.3-beta.1); pushes to branches do
+    # NOT trigger a build — a run is triggered explicitly via the tag.
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
   pull_request:
   workflow_dispatch:
 
@@ -25,20 +27,22 @@ env:
 jobs:
   # ===========================================================================
   # Job 1 - checks: fast correctness gate (Rust workspace tests + TS typecheck).
+  # Runs on every PR and tag. No real LLM key / network needed: all LLM tests
+  # use wiremock (local mock server); the real-ocr e2e is #[ignore]d.
   # ===========================================================================
   checks:
     name: checks (cargo test + tsc)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 9
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: pnpm
@@ -83,36 +87,51 @@ jobs:
         run: pnpm --dir ui run build
 
       - name: Run Rust workspace tests
-        run: cargo test --workspace --locked
+        # --no-fail-fast so one suite failure doesn't mask the others.
+        run: cargo test --workspace --locked --no-fail-fast
 
   # ===========================================================================
-  # Job 2 - build: Linux (.deb + portable loose-files tarball) and Windows (NSIS).
+  # Job 2 - build: portable loose-files distribution per platform/arch, built
+  # ONLY on semver tags. Windows + Linux target x64; macOS targets arm64
+  # (macos-latest is Apple Silicon by default). No installer bundles — the data
+  # lives next to the executable, so a plain folder/archive is the whole dist.
   # ===========================================================================
   build:
-    name: build (${{ matrix.platform }})
+    name: build (${{ matrix.platform }} ${{ matrix.arch }})
     needs: checks
+    if: startsWith(github.ref, 'refs/tags/')
     strategy:
       fail-fast: false
       matrix:
         include:
           # ubuntu-22.04 (not 24.04) => links against the older glibc 2.35, so the
-          # .deb and the portable tarball run on a much wider range of distros.
-          # AppImage is intentionally dropped (portable loose files cover that need).
+          # portable tarball runs on a much wider range of distros.
           - platform: ubuntu-22.04
-            args: '--bundles deb'
+            arch: x86_64
+            binary: felin-translator
+            artifact: felin-translator-linux-x86_64.tar.gz
           - platform: windows-latest
-            args: '--bundles nsis'
+            arch: x86_64
+            binary: felin-translator.exe
+            artifact: felin-translator-windows-x86_64.zip
+          # macos-latest defaults to arm64 (Apple Silicon); produces an arm64
+          # .app (a double-clickable bundle that needs no installer). An intel
+          # build is intentionally NOT done.
+          - platform: macos-latest
+            arch: aarch64
+            binary: felin-translator
+            artifact: felin-translator-macos-aarch64.tar.gz
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 9
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: pnpm
@@ -152,48 +171,61 @@ jobs:
       #     release. mock-ocr-cli is automated-test-only and must never ship in
       #     a production bundle, so nothing is staged for bundle.externalBin. ---
 
-      # --- Tauri CLI: the repo root (tauri-action's projectPath) has no package.json,
-      #     so tauri-action's package-manager auto-detection cannot find a JS `tauri`
-      #     script. Install a pinned CLI globally and point `tauriScript` straight at it. ---
+      # --- Tauri CLI: the repo root has no package.json, so install the pinned
+      #     CLI globally and call it directly (cwd = repo root; tauri auto-finds
+      #     src-tauri/ and runs beforeBuildCommand from the frontend dir ui/). ---
       - name: Install Tauri CLI
-        shell: bash
         run: npm install -g "@tauri-apps/cli@${{ env.TAURI_CLI_VERSION }}"
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          # Run from the repo root: it holds src-tauri/. Tauri v2 runs
-          # beforeBuildCommand ("pnpm build") with cwd = the frontend directory
-          # (ui/, where ui/package.json lives); frontendDist ("../ui/dist") is
-          # resolved relative to src-tauri/. The explicit build step above is
-          # belt-and-suspenders — tauri re-runs beforeBuildCommand itself.
-          projectPath: '.'
-          # Use the globally installed CLI (skips tauri-action's detection, which would
-          # otherwise fall back to auto-installing @tauri-apps/cli@v2 at build time).
-          tauriScript: 'tauri'
-          args: ${{ matrix.args }}
+      - name: Build app (release)
+        shell: bash
+        run: |
+          # macOS: produce the .app bundle (arm64, from the arm runner) so the
+          # result is a double-clickable app, not just a bare binary.
+          # Linux/Windows: --no-bundle produces the bare binary only; the
+          # loose-files archive is assembled manually below.
+          if [ "${{ matrix.platform }}" = "macos-latest" ]; then
+            tauri build --bundles app
+          else
+            tauri build --no-bundle
+          fi
 
-      # Portable "green" distribution: the app binary in one folder (data lives
-      # next to the executable), tarred for download. The OCR backend (ocr-cli)
-      # is user-provided and deliberately excluded from the bundle.
-      - name: Package Linux loose files (portable)
+      # ---------------------------------------------------------------
+      # Portable loose-files distribution: the app in one folder (data lives
+      # next to the executable). The OCR backend (ocr-cli) is user-provided
+      # and deliberately excluded.
+      # ---------------------------------------------------------------
+      - name: Package Linux loose files (x64)
         if: matrix.platform == 'ubuntu-22.04'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist/felin-translator
-          cp target/release/felin-translator dist/felin-translator/
-          tar -C dist -czf felin-translator-linux-x86_64.tar.gz felin-translator
-          ls -la felin-translator-linux-x86_64.tar.gz
+          cp "target/release/${{ matrix.binary }}" dist/felin-translator/
+          tar -C dist -czf "felin-translator-linux-x86_64.tar.gz" felin-translator
 
-      - name: Upload bundles as workflow artifacts
-        uses: actions/upload-artifact@v4
+      - name: Package Windows loose files (x64)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/felin-translator
+          cp "target/release/${{ matrix.binary }}" dist/felin-translator/
+          powershell -Command "cd dist; Compress-Archive -Path felin-translator -DestinationPath ../felin-translator-windows-x86_64.zip -Force"
+
+      - name: Package macOS loose files (arm64)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp -R "target/release/bundle/macos/Felin Translator.app" dist/
+          tar -C dist -czf "felin-translator-macos-aarch64.tar.gz" "Felin Translator.app"
+
+      - name: Upload loose-files bundle
+        uses: actions/upload-artifact@v7
         with:
-          name: felin-translator-${{ matrix.platform }}
-          path: |
-            target/release/bundle/deb/*.deb
-            felin-translator-linux-x86_64.tar.gz
-            target/release/bundle/nsis/*.exe
-          if-no-files-found: ignore
+          name: felin-translator-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ matrix.artifact }}
+          # A release build must produce its artifact; fail loudly if it didn't.
+          if-no-files-found: error
