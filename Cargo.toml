@@ -3,10 +3,10 @@ resolver = "2"
 members = ["crates/*", "src-tauri"]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2026"
 authors = ["Par1y"]
-license = "MIT"
+license = "AGPL-3.0"
 
 # Shared dependency versions live here so every workspace crate stays in lock-step.
 # Populated by `cargo add ... --workspace` during scaffolding; members reference
