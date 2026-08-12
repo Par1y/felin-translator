@@ -252,6 +252,8 @@ pub struct TuWithTranslation {
     /// Effective source text: the user's `source_override` if set, else the
     /// concatenated paragraph text.
     pub source: String,
+    /// True when `source` is a user override rather than the raw paragraphs.
+    pub source_overridden: bool,
     /// The enabled small-glossary entries `source` hits, de-duplicated by entry
     /// id in first-occurrence order (empty when none matched).
     pub matched_names: Vec<MatchedName>,

@@ -739,6 +739,20 @@ pub fn set_tu_source(
     with_project(&state, |p| p.db.set_tu_source(tu_id, &source))
 }
 
+/// Split a TU into two TUs at the given UTF-16 text offset (the 原文 TextArea's
+/// caret), either at a paragraph boundary or mid-paragraph. The original TU
+/// keeps its id (demoted, its draft/llm text cleared) and a new `pending` TU is
+/// inserted right after it. Only valid when the TU's source is its raw
+/// paragraphs (no `source_override`) and it is not mid-flight.
+#[tauri::command]
+pub fn split_tu_paragraph(
+    state: State<'_, AppState>,
+    tu_id: i64,
+    offset: usize,
+) -> Result<(), String> {
+    with_project(&state, |p| p.db.split_tu_at(tu_id, offset))
+}
+
 /// Persist an edited translation. Returns true if this demoted an
 /// approved/exported TU back to reviewing (i.e. the TU is no longer final).
 #[tauri::command]

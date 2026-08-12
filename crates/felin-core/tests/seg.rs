@@ -59,12 +59,52 @@ fn long_chapter_splits_into_even_blocks() {
 
 #[test]
 fn blocks_are_similar_sized_no_tiny_remainder() {
-    // 10 × 500 = 5000, target 3000 → 2 blocks of ~2500 (not 3000 + 2000).
+    // 10 × 500 = 5000, target 3000 → one 3000 block + absorbed 2000 tail
+    // (target size wins over an even split; no tiny remainder).
     let id = ids(10);
     let paras: Vec<_> = id.iter().map(|&i| (i, 500)).collect();
     let tus = aggregate(&paras, 3000);
     assert_eq!(tus.len(), 2);
-    assert_eq!(lens(&tus), vec![2500, 2500]);
+    assert_eq!(lens(&tus), vec![3000, 2000]);
+}
+
+#[test]
+fn no_tiny_block_from_a_boundary_straddling_paragraph() {
+    // A paragraph near a block boundary must not strand a tiny remainder:
+    // the 200-char paragraph is absorbed rather than left as its own block.
+    let id = ids(3);
+    let tus = aggregate(&[(id[0], 2900), (id[1], 2900), (id[2], 200)], 3000);
+    assert_eq!(tus.len(), 2);
+    assert_eq!(lens(&tus), vec![2900, 3100]);
+}
+
+#[test]
+fn tiny_tail_is_absorbed_into_the_block() {
+    let id = ids(2);
+    let tus = aggregate(&[(id[0], 3000), (id[1], 100)], 3000);
+    assert_eq!(tus.len(), 1);
+    assert_eq!(lens(&tus), vec![3100]);
+}
+
+#[test]
+fn single_huge_paragraph_keeps_neighbors_in_one_block() {
+    // A single paragraph already over target absorbs its small neighbors
+    // rather than splitting into a tiny companion block.
+    let id = ids(3);
+    let tus = aggregate(&[(id[0], 100), (id[1], 5900), (id[2], 100)], 3000);
+    assert_eq!(tus.len(), 1);
+    assert!(tus[0].oversize);
+}
+
+#[test]
+fn tiny_tail_after_a_closed_block_is_absorbed() {
+    // Regression: `remaining` must be the true tail length (based on all
+    // processed paragraphs), not the current block's length — otherwise the
+    // two 100-char paragraphs after two closed 2000-char blocks would strand
+    // as a tiny 200-char block instead of joining the last closed block.
+    let id = ids(4);
+    let tus = aggregate(&[(id[0], 2000), (id[1], 2000), (id[2], 100), (id[3], 100)], 2000);
+    assert_eq!(lens(&tus), vec![2000, 2200]);
 }
 
 #[test]

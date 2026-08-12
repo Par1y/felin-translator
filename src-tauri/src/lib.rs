@@ -88,6 +88,7 @@ pub fn run() {
             commands::set_prompt_config,
             commands::list_tus_with_translations,
             commands::set_tu_source,
+            commands::split_tu_paragraph,
             commands::set_translation_text,
             commands::delete_tus,
             commands::get_ocr_settings,

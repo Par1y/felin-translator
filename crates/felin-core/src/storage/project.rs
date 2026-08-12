@@ -668,6 +668,233 @@ impl ProjectDb {
         })
     }
 
+    /// Split a TU into two TUs at the UTF-16 text `offset` (the 原文 TextArea's
+    /// `selectionStart`) within this TU's effective source (paragraphs joined by
+    /// `\n`). The split point may be:
+    ///   - **mid-paragraph**: that paragraph's text is split into two paragraphs
+    ///     (the tail gets a fresh UUID), the left half stays in the original TU
+    ///     and the right half opens a new TU;
+    ///   - **at a paragraph boundary** (on the `\n`): paragraphs before the
+    ///     boundary stay in the original TU, the rest open a new TU.
+    ///
+    /// The original TU keeps its id (demoted to `reviewing`, its draft/llm text
+    /// cleared — its source changed) and the new TU is inserted right after it
+    /// as `pending`. Only valid when the source is the raw paragraphs (no
+    /// `source_override`) and the TU is not mid-flight.
+    pub fn split_tu_at(&self, tu_id: i64, offset: usize) -> Result<()> {
+        self.db.write(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+            // 1. TU row + guards.
+            let (ids_json, status, override_text, chapter_id, tu_ord): (String, String, Option<String>, i64, i64) =
+                tx.query_row(
+                    "SELECT paragraph_ids, status, source_override, chapter_id, ord FROM tus WHERE id = ?1",
+                    [tu_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )?;
+            if override_text.filter(|s| !s.trim().is_empty()).is_some() {
+                return Err(Error::InvalidInput {
+                    detail: "该条设置了原文覆盖，无法拆分".into(),
+                });
+            }
+            if status == TuStatus::Translating.as_str() {
+                return Err(Error::InvalidInput {
+                    detail: "该条正在翻译中，无法拆分".into(),
+                });
+            }
+            let ids: Vec<String> = serde_json::from_str(&ids_json)?;
+            if ids.is_empty() {
+                return Err(Error::InvalidInput {
+                    detail: "该条没有可拆分的段落".into(),
+                });
+            }
+
+            // 2. Load paragraphs in paragraph_ids order.
+            let mut paras: Vec<Paragraph> = Vec::with_capacity(ids.len());
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT id, chapter_id, ord, text, page_num, page_score, ocr_status, ocr_meta, source_file
+                     FROM paragraphs WHERE id = ?1",
+                )?;
+                for pid in &ids {
+                    paras.push(stmt.query_row([pid], row_to_paragraph)?);
+                }
+            }
+
+            // 3. Resolve the offset (UTF-16 → char) into either a paragraph
+            //    boundary index `bi` (paras[..bi] | paras[bi..], a split on the
+            //    `\n` between paras[bi-1] and paras[bi]) or a (para index, intra
+            //    char offset) split point.
+            let total_chars: usize = paras.iter().map(|p| p.text.chars().count()).sum::<usize>()
+                + (paras.len().saturating_sub(1));
+            let joined: String = paras.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n");
+            let char_idx = utf16_to_char_idx(&joined, offset);
+            if char_idx == 0 {
+                return Err(Error::InvalidInput {
+                    detail: "拆分点位于原文开头，无法拆分".into(),
+                });
+            }
+            if char_idx >= total_chars {
+                return Err(Error::InvalidInput {
+                    detail: "拆分点位于原文结尾，无法拆分".into(),
+                });
+            }
+            let mut start = 0usize;
+            let mut boundary: Option<usize> = None; // paras[..bi] | paras[bi..]
+            let mut intra: Option<(usize, usize)> = None; // (para index, char offset)
+            for (i, p) in paras.iter().enumerate() {
+                let len = p.text.chars().count();
+                if char_idx > start && char_idx < start + len {
+                    intra = Some((i, char_idx - start));
+                    break;
+                }
+                if char_idx == start {
+                    // Boundary before this paragraph (i>0; i==0 is the rejected
+                    // "start of source" case, except when a zero-length edge
+                    // makes it the only candidate).
+                    if i > 0 {
+                        boundary = Some(i);
+                        break;
+                    }
+                }
+                if char_idx == start + len {
+                    // Boundary on the '\n' right after this paragraph.
+                    boundary = Some(i + 1);
+                    break;
+                }
+                start += len + 1;
+            }
+            // char_idx may have fallen exactly on the final `\n` (== total-1
+            // would have been rejected; a mid-stream separator is caught above).
+            // Fallback guard: an offset inside a separator after the last
+            // paragraph has no valid split.
+            if boundary.is_none() && intra.is_none() {
+                return Err(Error::InvalidInput {
+                    detail: "拆分位置超出原文范围".into(),
+                });
+            }
+
+            // 4. Build the two TU's paragraph-id lists, splitting text if needed.
+            let tu1_ids: Vec<String>;
+            let tu2_ids: Vec<String>;
+            if let Some(bi) = boundary {
+                if bi == 0 || bi >= paras.len() {
+                    return Err(Error::InvalidInput {
+                        detail: "拆分点必须位于两个段落之间".into(),
+                    });
+                }
+                tu1_ids = ids[..bi].to_vec();
+                tu2_ids = ids[bi..].to_vec();
+            } else {
+                let (pi, intra_off) = intra.unwrap();
+                let src = &paras[pi];
+                let left: String = src.text.chars().take(intra_off).collect();
+                let right: String = src.text.chars().skip(intra_off).collect();
+                if left.is_empty() || right.is_empty() {
+                    return Err(Error::InvalidInput {
+                        detail: "拆分点位于段落开头或结尾，未产生拆分".into(),
+                    });
+                }
+                // Refuse when the split paragraph is shared by another TU.
+                let refs: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM tus WHERE paragraph_ids LIKE ?1",
+                    [format!("%\"{}\"%", src.id)],
+                    |r| r.get(0),
+                )?;
+                if refs > 1 {
+                    return Err(Error::InvalidInput {
+                        detail: "该段落同时被多个 TU 引用，无法拆分".into(),
+                    });
+                }
+                // Tail gets a fresh UUID; shift later paragraphs' ords; insert.
+                let new_id = Uuid::new_v4().to_string();
+                tx.execute(
+                    "UPDATE paragraphs SET ord = ord + 1 WHERE chapter_id = ?1 AND ord > ?2",
+                    rusqlite::params![src.chapter_id, src.ord],
+                )?;
+                let meta = src.ocr_meta.as_ref().map(|m| serde_json::to_string(m)).transpose()?;
+                tx.execute(
+                    "INSERT INTO paragraphs (id, chapter_id, ord, text, page_num, page_score, ocr_status, ocr_meta, source_file)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        new_id,
+                        src.chapter_id,
+                        src.ord + 1,
+                        right,
+                        src.page_num,
+                        src.page_score,
+                        src.ocr_status,
+                        meta,
+                        src.source_file,
+                    ],
+                )?;
+                tx.execute(
+                    "UPDATE paragraphs SET text = ?1 WHERE id = ?2",
+                    rusqlite::params![left, src.id],
+                )?;
+                tu1_ids = ids[..=pi].to_vec();
+                let mut tail = vec![new_id];
+                tail.extend(ids[pi + 1..].iter().cloned());
+                tu2_ids = tail;
+            }
+            if tu1_ids.is_empty() || tu2_ids.is_empty() {
+                return Err(Error::InvalidInput {
+                    detail: "拆分后任一侧不能为空".into(),
+                });
+            }
+
+            // 5. Shift later TUs' ords in this chapter, then update the original
+            //    TU to the left half and insert the right half as a new TU.
+            tx.execute(
+                "UPDATE tus SET ord = ord + 1 WHERE chapter_id = ?1 AND ord > ?2",
+                rusqlite::params![chapter_id, tu_ord],
+            )?;
+            // Budget = sum of paragraph char lengths (the source that spans the
+            // two halves differs from `total_chars` by the dropped `\n`, so
+            // recompute from the DB).
+            let tu1_len = paras_of_len(&tx, &tu1_ids)?;
+            let tu2_len = paras_of_len(&tx, &tu2_ids)?;
+            // The left half keeps a scheduler-claimable status when it was never
+            // translated (pending/queued — its "translation" is nothing to
+            // preserve, so it stays claimable); any finished/failed state means
+            // the old translation is now stale → demote to reviewing.
+            let original_claimable = matches!(status.as_str(), "pending" | "queued");
+            let left_status = if original_claimable { "pending" } else { "reviewing" };
+            tx.execute(
+                "UPDATE tus SET paragraph_ids = ?1, budget = ?2, status = ?3 WHERE id = ?4",
+                rusqlite::params![
+                    serde_json::to_string(&tu1_ids)?,
+                    tu1_len as i64,
+                    left_status,
+                    tu_id,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO tus (chapter_id, paragraph_ids, ord, budget, status)
+                 VALUES (?1, ?2, ?3, ?4, 'pending')",
+                rusqlite::params![
+                    chapter_id,
+                    serde_json::to_string(&tu2_ids)?,
+                    tu_ord + 1,
+                    tu2_len as i64,
+                ],
+            )?;
+
+            // 6. The original TU's translation (if any) is stale — its source
+            //    changed. Clear it. When the left half is still claimable
+            //    (pending), there was no translation to clear anyway.
+            tx.execute(
+                "UPDATE translations SET status = 'draft', final_text = NULL, llm_text = NULL,
+                        error = NULL, source_hash = NULL, instruction = NULL, attempts = NULL, updated_at = ?1
+                 WHERE tu_id = ?2",
+                rusqlite::params![now_iso8601(), tu_id],
+            )?;
+
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Concatenated source text of a TU — its paragraphs, in order, joined by
     /// `\n` — unless the user set a `source_override`, which wins verbatim.
     pub fn tu_source(&self, tu_id: i64) -> Result<String> {
@@ -779,6 +1006,7 @@ impl ProjectDb {
                 let ids_json: String = r.get(4)?;
                 let paragraph_ids: Vec<String> = serde_json::from_str(&ids_json).unwrap_or_default();
                 let override_text: Option<String> = r.get(5)?;
+                let source_overridden = override_text.as_deref().is_some_and(|s| !s.trim().is_empty());
                 let source = match override_text.filter(|s| !s.trim().is_empty()) {
                     Some(s) => s,
                     None => {
@@ -798,6 +1026,7 @@ impl ProjectDb {
                     ord: r.get(1)?,
                     budget: r.get(2)?,
                     status: r.get(3)?,
+                    source_overridden,
                     translation_status: r.get(6)?,
                     final_text: r.get(7)?,
                     llm_text: r.get(8)?,
@@ -1377,6 +1606,31 @@ impl ProjectDb {
             Ok(SegmentOutcome { chapters: new_chapter_ids.len(), tus: total_tus })
         })
     }
+}
+
+/// Convert a UTF-16 code-unit offset (browser `selectionStart`) to a `char`
+/// index into `s`, clamped to the end.
+fn utf16_to_char_idx(s: &str, utf16: usize) -> usize {
+    let mut units = 0usize;
+    for (i, c) in s.chars().enumerate() {
+        if units >= utf16 {
+            return i;
+        }
+        units += c.len_utf16();
+    }
+    s.chars().count()
+}
+
+/// Sum of the character lengths of the given paragraph ids (their current DB
+/// text). Used to compute a TU's budget after a split.
+fn paras_of_len(conn: &rusqlite::Connection, ids: &[String]) -> Result<usize> {
+    let mut n = 0usize;
+    let mut stmt = conn.prepare("SELECT text FROM paragraphs WHERE id = ?1")?;
+    for id in ids {
+        let t: String = stmt.query_row([id], |r| r.get(0))?;
+        n += t.chars().count();
+    }
+    Ok(n)
 }
 
 fn row_to_paragraph(r: &rusqlite::Row<'_>) -> rusqlite::Result<Paragraph> {

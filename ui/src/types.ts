@@ -317,6 +317,8 @@ export interface TuWithTranslation {
   translation_status: string | null;
   /** Effective source: the user's source_override if set, else the paragraphs. */
   source: string;
+  /** True when `source` is a user override rather than the raw paragraphs. */
+  source_overridden: boolean;
   /** Enabled small-glossary entries this source hit (what prompt injection applied). */
   matched_names: MatchedName[];
   final_text: string | null;

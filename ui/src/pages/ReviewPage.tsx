@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   App as AntdApp,
   Button,
   Card,
   Checkbox,
   Empty,
+  Flex,
   Input,
   InputNumber,
   List,
+  Menu,
   Modal,
+  Pagination,
   Popconfirm,
   Select,
   Space,
@@ -120,6 +124,37 @@ function TuCard({
   /// injection applied — rendered as 专名 tags under the 原文.
   const matched = tu.matched_names ?? [];
 
+  // Right-click context menu on the 原文 TextArea: split the paragraph at the
+  // caret. `offset` is the UTF-16 selectionStart captured at right-click time.
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; offset: number } | null>(null);
+
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [ctxMenu]);
+
+  const handleSplit = async (offset: number) => {
+    setCtxMenu(null);
+    try {
+      await api.splitTuParagraph(tu.id, offset);
+      message.success("已在此处拆分为两条");
+      onChanged();
+    } catch (e) {
+      message.error(String(e));
+    }
+  };
+
   return (
     <Card
       size="small"
@@ -148,68 +183,96 @@ function TuCard({
         </Typography.Paragraph>
       )}
       <Space direction="vertical" style={{ width: "100%" }} size="small">
-        <div>
-          <Typography.Text
-            type="secondary"
-            style={{ display: "block", marginBottom: 4 }}
-          >
-            原文
-          </Typography.Text>
-          <Input.TextArea
-            value={source}
-            onChange={(e) => {
-              setSource(e.target.value);
-              setDirty(true);
-            }}
-            onBlur={commitSource}
-            autoSize={{ minRows: 2, maxRows: 8 }}
-          />
-          {matched.length > 0 ? (
-            <div style={{ marginTop: 6 }}>
-              <Typography.Text
-                type="secondary"
-                style={{ fontSize: 12, marginRight: 6 }}
-              >
-                专名：
-              </Typography.Text>
-              {matched.map((m, i) => (
-                <Tag
-                  key={`${m.japanese}-${i}`}
-                  color="geekblue"
-                  style={{ marginRight: 4, marginBottom: 2 }}
-                >
-                  {m.chinese && m.chinese.trim()
-                    ? `${m.japanese} → ${m.chinese}`
-                    : m.japanese}
-                </Tag>
-              ))}
-            </div>
-          ) : (
+        <Flex gap={12} wrap style={{ width: "100%" }}>
+          {/* 原文 column (~50%) */}
+          <Flex vertical flex="1 1 0" style={{ minWidth: 0 }}>
             <Typography.Text
               type="secondary"
-              style={{ display: "block", marginTop: 4, fontSize: 12 }}
+              style={{ display: "block", marginBottom: 4 }}
             >
-              专名：—
+              原文
             </Typography.Text>
-          )}
-        </div>
-        <div>
-          <Typography.Text
-            type="secondary"
-            style={{ display: "block", marginBottom: 4 }}
-          >
-            译文
-          </Typography.Text>
-          <Input.TextArea
-            value={trans}
-            onChange={(e) => {
-              setTrans(e.target.value);
-              setDirty(true);
-            }}
-            onBlur={commitTrans}
-            autoSize={{ minRows: 2, maxRows: 10 }}
-          />
-        </div>
+            <Input.TextArea
+              value={source}
+              onChange={(e) => {
+                setSource(e.target.value);
+                setDirty(true);
+              }}
+              onBlur={commitSource}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                const el = e.currentTarget;
+                // Some webviews (WebKitGTK/Firefox) don't move the caret on
+                // right-click; derive the exact offset at the clicked point and
+                // move the caret there so the split fires where the user
+                // actually right-clicked.
+                let clicked = el.selectionStart ?? 0;
+                const doc = el.ownerDocument;
+                if ("caretRangeFromPoint" in doc) {
+                  const r = (doc as Document & {
+                    caretRangeFromPoint(x: number, y: number): Range | null;
+                  }).caretRangeFromPoint(e.clientX, e.clientY);
+                  if (r) clicked = r.startOffset;
+                } else if ("caretPositionFromPoint" in doc) {
+                  const pos = (doc as Document & {
+                    caretPositionFromPoint(x: number, y: number): { offset: number } | null;
+                  }).caretPositionFromPoint(e.clientX, e.clientY);
+                  if (pos) clicked = pos.offset;
+                }
+                el.setSelectionRange(clicked, clicked);
+                setCtxMenu({ x: e.clientX, y: e.clientY, offset: clicked });
+              }}
+              autoSize={{ minRows: 2, maxRows: 8 }}
+            />
+            {matched.length > 0 ? (
+              <div style={{ marginTop: 6 }}>
+                <Typography.Text
+                  type="secondary"
+                  style={{ fontSize: 12, marginRight: 6 }}
+                >
+                  专名：
+                </Typography.Text>
+                {matched.map((m, i) => (
+                  <Tag
+                    key={`${m.japanese}-${i}`}
+                    color="geekblue"
+                    style={{ marginRight: 4, marginBottom: 2 }}
+                  >
+                    {m.chinese && m.chinese.trim()
+                      ? `${m.japanese} → ${m.chinese}`
+                      : m.japanese}
+                  </Tag>
+                ))}
+              </div>
+            ) : (
+              <Typography.Text
+                type="secondary"
+                style={{ display: "block", marginTop: 4, fontSize: 12 }}
+              >
+                专名：—
+              </Typography.Text>
+            )}
+          </Flex>
+
+          {/* 译文 column (~50%) */}
+          <Flex vertical flex="1 1 0" style={{ minWidth: 0 }}>
+            <Typography.Text
+              type="secondary"
+              style={{ display: "block", marginBottom: 4 }}
+            >
+              译文
+            </Typography.Text>
+            <Input.TextArea
+              value={trans}
+              onChange={(e) => {
+                setTrans(e.target.value);
+                setDirty(true);
+              }}
+              onBlur={commitTrans}
+              autoSize={{ minRows: 2, maxRows: 10 }}
+            />
+          </Flex>
+        </Flex>
         <Space>
           <Button
             size="small"
@@ -221,6 +284,44 @@ function TuCard({
           </Button>
         </Space>
       </Space>
+
+      {/* 右键拆分菜单：仅在原文区（未编辑/未覆盖原文时可用） */}
+      {createPortal(
+        ctxMenu && (
+          <div
+            style={{ position: "fixed", inset: 0, zIndex: 1000 }}
+            onClick={() => setCtxMenu(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setCtxMenu(null);
+            }}
+          >
+            <div
+              style={{ position: "absolute", left: ctxMenu.x, top: ctxMenu.y }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Menu
+                items={[
+                  {
+                    key: "split",
+                    label: "在此拆分为两条",
+                    disabled: source !== tu.source || tu.source_overridden,
+                  },
+                ]}
+                onClick={({ key }) => {
+                  if (key === "split") void handleSplit(ctxMenu.offset);
+                }}
+                style={{
+                  minWidth: 160,
+                  boxShadow: "0 6px 16px rgba(0,0,0,0.15)",
+                  borderRadius: 8,
+                }}
+              />
+            </div>
+          </div>
+        ),
+        document.body,
+      )}
     </Card>
   );
 }
@@ -243,10 +344,19 @@ export default function ReviewPage() {
   const [retranslateModal, setRetranslateModal] = useState(false);
   const [retranslateInstr, setRetranslateInstr] = useState("");
   const chapterIdRef = useRef<number | null>(null);
+  // Frontend pagination for the TU card list (many TUs would make the page
+  // unwieldy; the page is local to the current filter/chapter).
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
 
   useEffect(() => {
     chapterIdRef.current = chapterId;
   }, [chapterId]);
+
+  // Switching chapter or status filter resets to page 1.
+  useEffect(() => {
+    setPage(1);
+  }, [chapterId, group]);
 
   const loadChapters = useCallback(
     async (selectFirst = false) => {
@@ -385,6 +495,14 @@ export default function ReviewPage() {
     groupStates.length === 0
       ? tuRows
       : tuRows.filter((t) => groupStates.includes(t.status));
+  // When the filtered list shrinks (pipeline finishes items, deletions), a
+  // page that now exceeds the page count would render an empty list — clamp it.
+  const pageCount = Math.max(1, Math.ceil(shown.length / pageSize));
+  useEffect(() => {
+    if (page > pageCount) setPage(pageCount);
+  }, [page, pageCount]);
+  // Current page's slice of the filtered list (frontend pagination).
+  const paged = shown.slice((page - 1) * pageSize, page * pageSize);
   const totalCount = translation.counts.reduce((a, c) => a + c.count, 0);
   // Batch-selection state against the currently-shown TU cards.
   const selectedShown = shown.filter((t) => selectedIds.has(t.id)).length;
@@ -510,20 +628,35 @@ export default function ReviewPage() {
       {shown.length === 0 ? (
         <Empty description="本章暂无 TU（请先自动分段，或切换筛选）" />
       ) : (
-        <List
-          grid={{ gutter: 16, column: 1 }}
-          dataSource={shown}
-          renderItem={(tu) => (
-            <List.Item key={tu.id}>
-              <TuCard
-                tu={tu}
-                selected={selectedIds.has(tu.id)}
-                onToggleSelected={toggleSelected}
-                onChanged={() => void refreshTranslation()}
-              />
-            </List.Item>
-          )}
-        />
+        <>
+          <List
+            grid={{ gutter: 16, column: 1 }}
+            dataSource={paged}
+            renderItem={(tu) => (
+              <List.Item key={tu.id}>
+                <TuCard
+                  tu={tu}
+                  selected={selectedIds.has(tu.id)}
+                  onToggleSelected={toggleSelected}
+                  onChanged={() => void refreshTranslation()}
+                />
+              </List.Item>
+            )}
+          />
+          <Space direction="vertical" align="center" style={{ width: "100%", marginTop: 8 }}>
+            <Pagination
+              current={page}
+              pageSize={pageSize}
+              total={shown.length}
+              showSizeChanger
+              pageSizeOptions={[10, 20, 50]}
+              onChange={(p, ps) => {
+                setPage(p);
+                setPageSize(ps);
+              }}
+            />
+          </Space>
+        </>
       )}
 
       {/* 重译确认子菜单：可填额外指示（适用于当前所有勾选的 TU）。 */}

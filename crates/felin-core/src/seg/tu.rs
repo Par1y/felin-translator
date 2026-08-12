@@ -1,12 +1,12 @@
 //! Splitting a chapter's paragraphs into similar-sized Translation blocks (TUs)
 //! for parallel translation.
 //!
-//! Strategy (per project direction): **natural paragraph breaks are primary, the
-//! character size is a soft target**. A long chapter (or a book with no chapter
-//! divisions) is divided into `N ≈ round(total / target)` blocks of roughly equal
-//! size, splitting only at paragraph boundaries. Blocks may run a little over or
-//! under the target to respect those boundaries — the few seams that creates are
-//! handled at merge/proofread time. A short chapter stays a single block.
+//! Strategy (per project direction): **the target block size is the priority,
+//! natural paragraph breaks are soft boundaries**. A long chapter (or a book
+//! with no chapter divisions) is divided into blocks of roughly `target`
+//! characters, splitting only at paragraph boundaries. A block is never closed
+//! at a boundary while it is still far below the target — small remainder
+//! paragraphs are absorbed into the current block so no tiny block is stranded.
 
 use uuid::Uuid;
 
@@ -21,41 +21,62 @@ pub struct TuPlan {
     pub oversize: bool,
 }
 
-/// Split `(paragraph_id, char_len)` pairs (in order) into ~equal blocks near
-/// `target` characters, cutting only at paragraph boundaries.
+/// Split `(paragraph_id, char_len)` pairs (in order) into blocks near `target`
+/// characters, cutting only at paragraph boundaries.
+///
+/// Size wins over natural breaks: a block only closes at a boundary once it is
+/// close enough to `target` (reached it, or is at least half a target and the
+/// next paragraph would push it far over). Any tail smaller than half a target
+/// is absorbed into the last block rather than stranded as a tiny remainder.
 pub fn aggregate(paras: &[(Uuid, usize)], target: usize) -> Vec<TuPlan> {
     if paras.is_empty() {
         return Vec::new();
     }
     let target = target.max(1);
     let total: usize = paras.iter().map(|(_, l)| *l).sum();
-    // Number of similar-sized blocks; the char target is a soft guide, so we
-    // round (a chapter only slightly over target stays one block rather than
-    // spawning a tiny remainder).
-    let n = ((total as f64 / target as f64).round() as usize).max(1);
-    let ideal = total as f64 / n as f64;
+    let half = target / 2; // "meaningful block" floor; absorb tails at or below this
 
     let mut blocks: Vec<TuPlan> = Vec::new();
     let mut ids: Vec<Uuid> = Vec::new();
     let mut cur_len = 0usize;
-    let mut cumulative = 0usize;
+    // Length of every paragraph processed so far (never reset on block close),
+    // so `remaining` stays the true tail size — not inflated by closed blocks.
+    let mut consumed = 0usize;
 
-    for &(id, plen) in paras {
+    for (i, &(id, plen)) in paras.iter().enumerate() {
         ids.push(id);
         cur_len += plen;
-        cumulative += plen;
-        // Close the current block once we cross its ideal cumulative boundary,
-        // unless we're already filling the last block.
-        let k = blocks.len() + 1;
-        if k < n && cumulative as f64 >= k as f64 * ideal {
-            let oversize = cur_len > target;
-            blocks.push(TuPlan { paragraph_ids: std::mem::take(&mut ids), char_len: cur_len, oversize });
+        consumed += plen;
+        let remaining = total - consumed;
+
+        if i + 1 == paras.len() {
+            // Last paragraph always closes the current block.
+            blocks.push(TuPlan {
+                paragraph_ids: std::mem::take(&mut ids),
+                char_len: cur_len,
+                oversize: cur_len > target,
+            });
+            continue;
+        }
+        // Absorb a small tail rather than strand it as a tiny block.
+        if remaining <= half {
+            continue;
+        }
+        // Close at a natural break once the block is close enough to target:
+        //  - it already reached target, OR
+        //  - it is at least half a target and the next paragraph would push it
+        //    far over (> 1.5× target).
+        let next_len = paras[i + 1].1;
+        let reached = cur_len >= target;
+        let would_overshoot = cur_len + next_len > target + half;
+        if reached || (cur_len >= half && would_overshoot) {
+            blocks.push(TuPlan {
+                paragraph_ids: std::mem::take(&mut ids),
+                char_len: cur_len,
+                oversize: cur_len > target,
+            });
             cur_len = 0;
         }
-    }
-    if !ids.is_empty() {
-        let oversize = cur_len > target;
-        blocks.push(TuPlan { paragraph_ids: ids, char_len: cur_len, oversize });
     }
     blocks
 }

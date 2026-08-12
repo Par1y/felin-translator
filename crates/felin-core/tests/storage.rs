@@ -381,6 +381,131 @@ fn segment_cleans_detects_chapters_and_builds_tus() {
 }
 
 #[test]
+fn split_tu_at_mid_paragraph_creates_two_tus() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let ch = p.get_or_create_chapter("import").unwrap();
+
+    let mk = |t: &str| {
+        IngestedParagraph::new(
+            t.into(),
+            Some(1),
+            "b.pdf".into(),
+            None,
+            OcrParagraphStatus::Ok,
+            serde_json::Value::Null,
+        )
+    };
+    // One long paragraph whose text we'll split mid-way into two TUs.
+    let para_text = "本文A。続きの文章ここまで。";
+    p.insert_paragraphs(ch, &[mk(para_text)]).unwrap();
+    p.segment(3000, "正文", &felin_core::seg::ChapterRecognizer::default()).unwrap();
+
+    let chapters = p.list_chapters().unwrap();
+    let tus = p.list_tus(chapters[0].id).unwrap();
+    assert_eq!(tus.len(), 1);
+    let tu = &tus[0];
+    assert_eq!(tu.paragraph_ids.len(), 1);
+
+    // Offset 4 lands between "本文A。" and "続…" (all BMP, 1 UTF-16 unit each).
+    p.split_tu_at(tu.id, 4).unwrap();
+
+    // One TU becomes two, in order: left stays original, right is new.
+    let after = p.list_tus(chapters[0].id).unwrap();
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].id, tu.id);
+    assert_eq!(after[1].ord, after[0].ord + 1);
+    assert_eq!(after[1].status, felin_core::types::TuStatus::Pending);
+    assert_eq!(after[0].paragraph_ids.len(), 1);
+    assert_eq!(after[1].paragraph_ids.len(), 1);
+
+    // The two halves' sources reconstruct the original paragraph.
+    let src1 = p.tu_source(after[0].id).unwrap();
+    let src2 = p.tu_source(after[1].id).unwrap();
+    assert_eq!(src1, "本文A。");
+    assert_eq!(src2, "続きの文章ここまで。");
+
+    // Paragraph rows are dense in ord order (tail got a new row).
+    let paras = p.list_paragraphs(chapters[0].id).unwrap();
+    assert_eq!(paras.len(), 2);
+    assert_eq!(paras[0].ord, 0);
+    assert_eq!(paras[1].ord, 1);
+}
+
+#[test]
+fn split_tu_at_paragraph_boundary_splits_between_paragraphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let ch = p.get_or_create_chapter("import").unwrap();
+
+    let mk = |t: &str| {
+        IngestedParagraph::new(
+            t.into(),
+            Some(1),
+            "b.pdf".into(),
+            None,
+            OcrParagraphStatus::Ok,
+            serde_json::Value::Null,
+        )
+    };
+    // Two paragraphs in one TU.
+    p.insert_paragraphs(ch, &[mk("本文A。本文B。本文C。"), mk("第二段。")]).unwrap();
+    p.segment(3000, "正文", &felin_core::seg::ChapterRecognizer::default()).unwrap();
+    let chapters = p.list_chapters().unwrap();
+    let tu = &p.list_tus(chapters[0].id).unwrap()[0];
+    assert_eq!(tu.paragraph_ids.len(), 2);
+
+    // Boundary on the '\n' between the two paragraphs: para0 is 12 chars, so
+    // the boundary is at UTF-16 offset 12.
+    p.split_tu_at(tu.id, 12).unwrap();
+
+    let after = p.list_tus(chapters[0].id).unwrap();
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].paragraph_ids.len(), 1);
+    assert_eq!(after[1].paragraph_ids.len(), 1);
+    assert_eq!(p.tu_source(after[0].id).unwrap(), "本文A。本文B。本文C。");
+    assert_eq!(p.tu_source(after[1].id).unwrap(), "第二段。");
+}
+
+#[test]
+fn split_tu_at_rejects_edges_override_and_translating() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();
+    let ch = p.get_or_create_chapter("import").unwrap();
+
+    let mk = |t: &str| {
+        IngestedParagraph::new(
+            t.into(),
+            Some(1),
+            "b.pdf".into(),
+            None,
+            OcrParagraphStatus::Ok,
+            serde_json::Value::Null,
+        )
+    };
+    p.insert_paragraphs(ch, &[mk("本文A。本文B。本文C。"), mk("第二段。")]).unwrap();
+    p.segment(3000, "正文", &felin_core::seg::ChapterRecognizer::default()).unwrap();
+    let chapters = p.list_chapters().unwrap();
+    let tu = &p.list_tus(chapters[0].id).unwrap()[0];
+
+    // Start / end of the source → no valid split.
+    assert!(p.split_tu_at(tu.id, 0).is_err(), "source start must be rejected");
+    assert!(p.split_tu_at(tu.id, 999).is_err(), "past-the-end must be rejected");
+
+    // A source_override makes splitting invalid.
+    p.set_tu_source(tu.id, "自定义原文覆盖").unwrap();
+    assert!(p.split_tu_at(tu.id, 2).is_err(), "source_override must be rejected");
+    p.set_tu_source(tu.id, "").unwrap();
+
+    // A translating TU cannot be split.
+    p.claim_tu(tu.id).unwrap();
+    p.fail_translation(tu.id, "x", false).unwrap();
+    p.retranslate_tus(&[tu.id], None).unwrap();
+    p.claim_tu(tu.id).unwrap();
+    assert!(p.split_tu_at(tu.id, 2).is_err(), "translating must be rejected");
+}
+
+#[test]
 fn small_glossary_crud_and_matcher_filters_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let p = ProjectDb::open(&dir.path().join("project.db")).unwrap();

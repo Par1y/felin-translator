@@ -117,6 +117,8 @@ export const api = {
   listTusWithTranslations: (chapterId: number) =>
     invoke<TuWithTranslation[]>("list_tus_with_translations", { chapterId }),
   setTuSource: (tuId: number, source: string) => invoke<void>("set_tu_source", { tuId, source }),
+  splitTuParagraph: (tuId: number, offset: number) =>
+    invoke<void>("split_tu_paragraph", { tuId, offset }),
   setTranslationText: (tuId: number, text: string) =>
     invoke<boolean>("set_translation_text", { tuId, text }),
   deleteTus: (ids: number[]) => invoke<number>("delete_tus", { ids }),
