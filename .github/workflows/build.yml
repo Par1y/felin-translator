@@ -14,8 +14,9 @@ concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege: building + uploading workflow artifacts needs no write scope.
-# Bump to `contents: write` only if you later add `tagName:` to create a Release.
+# Least privilege: checks + build need no write scope; the `release` job needs
+# `contents: write` to create the GitHub Release and attach artifacts (scoped to
+# that job only).
 permissions:
   contents: read
 
@@ -229,3 +230,38 @@ jobs:
           path: ${{ matrix.artifact }}
           # A release build must produce its artifact; fail loudly if it didn't.
           if-no-files-found: error
+
+  # ===========================================================================
+  # Job 3 - release: attach the built archives to the GitHub Release for the
+  # tag (created by the tag push). Runs only on semver tags; the source archive
+  # GitHub auto-creates is NOT the product — the compiled bundles are.
+  # ===========================================================================
+  release:
+    name: release (${{ github.ref_name }})
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Inspect downloaded bundles
+        run: |
+          ls -la dist/
+          test -n "$(find dist -name '*.tar.gz' -o -name '*.zip')" || {
+            echo "::error::no compiled bundles found to release"
+            exit 1
+          }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+          generate_release_notes: true
