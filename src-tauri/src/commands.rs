@@ -1699,13 +1699,16 @@ pub struct LlmConfigView {
     pub has_key: bool,
 }
 
-/// Build an `LlmConfig` from the technical defaults plus the project's saved
-/// user-facing settings (endpoint/model/key).
+/// Build an `LlmConfig` from `felin.toml [llm]` (transport tunables plus the
+/// endpoint/model seeds), overridden by the project's saved user-facing
+/// settings (endpoint/model/key) from the GUI.
 fn load_llm_config(
     db: &ProjectDb,
     defaults: &felin_core::config::LlmDefaults,
 ) -> Result<felin_core::llm::LlmConfig, String> {
     let mut cfg = felin_core::llm::LlmConfig {
+        endpoint: defaults.endpoint.clone(),
+        model: defaults.model.clone(),
         timeout: std::time::Duration::from_secs(defaults.timeout_secs),
         max_retries: defaults.max_retries,
         base_delay: std::time::Duration::from_millis(defaults.base_delay_ms),
@@ -1724,23 +1727,35 @@ fn load_llm_config(
     if let Some(k) = db.get_setting("llm_api_key").map_err(|e| e.to_string())? {
         cfg.api_key = k;
     }
+    // Fail fast with an actionable message instead of letting an empty endpoint
+    // reach reqwest as a relative URL (a permanent config error would otherwise
+    // burn max_retries+1 attempts and surface a cryptic builder error).
+    if cfg.endpoint.trim().is_empty() {
+        return Err("未配置 LLM 接口地址（endpoint）：请到设置页填写，\
+                    或在 felin.toml [llm] 中设置 endpoint"
+            .to_string());
+    }
     Ok(cfg)
 }
 
 #[tauri::command]
 pub fn get_llm_config(state: State<'_, AppState>) -> Result<LlmConfigView, String> {
+    // Per-project GUI settings win; absent ones fall back to the `felin.toml
+    // [llm]` seeds so the settings page shows the file-configured values.
+    let seed_endpoint = state.config.llm.endpoint.clone();
+    let seed_model = state.config.llm.model.clone();
     with_project(&state, |p| {
         Ok(LlmConfigView {
             endpoint: p
                 .db
                 .get_setting("llm_endpoint")?
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| felin_core::llm::DEFAULT_ENDPOINT.to_string()),
+                .unwrap_or(seed_endpoint),
             model: p
                 .db
                 .get_setting("llm_model")?
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| felin_core::llm::DEFAULT_MODEL.to_string()),
+                .unwrap_or(seed_model),
             has_key: p.db.get_setting("llm_api_key")?.is_some_and(|k| !k.is_empty()),
         })
     })

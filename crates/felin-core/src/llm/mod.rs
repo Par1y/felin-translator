@@ -1,9 +1,11 @@
 //! LLM client (plan step 6): an OpenAI-compatible chat client with a plaintext
 //! translation contract, retry/backoff, and tolerant JSON extraction for the
-//! (non-fatal) name-extraction pass. Default target: StepFun `step-3.7-flash`.
+//! (non-fatal) name-extraction pass.
 //!
-//! Endpoint / model / key come from the GUI settings page (wired in a later
-//! step); this module stays transport-only and Tauri-agnostic.
+//! Fully config-driven: endpoint / model are seeded from `felin.toml [llm]`
+//! (see `crate::config::LlmDefaults`) and overridable per project in the GUI
+//! settings page; the key comes from the GUI. This module stays transport-only
+//! and Tauri-agnostic.
 
 pub mod client;
 pub mod json;
@@ -18,11 +20,6 @@ pub use tokio::sync::Semaphore;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-
-/// Default OpenAI-compatible base URL (StepFun).
-pub const DEFAULT_ENDPOINT: &str = "https://api.stepfun.com/v1";
-/// Default model.
-pub const DEFAULT_MODEL: &str = "step-3.7-flash";
 
 /// Chat message role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,9 +72,12 @@ pub struct LlmConfig {
 
 impl Default for LlmConfig {
     fn default() -> Self {
+        // endpoint/model are empty by design: the runtime bakes in no provider.
+        // Real values come from `felin.toml [llm]` (whose first-launch template
+        // ships the factory endpoint/model) plus per-project GUI settings.
         Self {
-            endpoint: DEFAULT_ENDPOINT.to_string(),
-            model: DEFAULT_MODEL.to_string(),
+            endpoint: String::new(),
+            model: String::new(),
             api_key: String::new(),
             timeout: Duration::from_secs(120),
             max_retries: 3,

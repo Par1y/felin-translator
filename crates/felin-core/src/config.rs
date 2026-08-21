@@ -188,10 +188,24 @@ pub(crate) fn factory_prompt_config() -> PromptConfig {
     }
 }
 
-/// Default LLM transport tunables (endpoint/model/key are user-facing, set in the GUI).
+/// Default LLM transport tunables plus the endpoint/model *seeds*
+/// (`felin.toml [llm]`).
+///
+/// Like [`PromptConfig`], `endpoint`/`model` are **empty in-code by design**:
+/// the runtime never falls back to a baked-in provider. The first-launch
+/// template ([`TechConfig::default_template`]) ships the factory endpoint/model
+/// so a fresh install connects out of the box, and the GUI settings page can
+/// override both per project (project DB `llm_endpoint` / `llm_model`). An
+/// empty endpoint means "not configured" — LLM features then fail with a
+/// connection error until one is set, never silently calling a hidden default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmDefaults {
+    /// OpenAI-compatible base URL used when the current project has not saved
+    /// its own in the GUI (a bare base or a full chat-completions URL).
+    pub endpoint: String,
+    /// Model name seed, likewise per-project overridable.
+    pub model: String,
     pub timeout_secs: u64,
     pub max_retries: u32,
     pub base_delay_ms: u64,
@@ -209,6 +223,8 @@ pub struct LlmDefaults {
 impl Default for LlmDefaults {
     fn default() -> Self {
         Self {
+            endpoint: String::new(),
+            model: String::new(),
             timeout_secs: 120,
             max_retries: 3,
             base_delay_ms: 500,
@@ -316,6 +332,9 @@ max_manifest_bytes = 67108864
 fuzzy_max_distance = 1
 
 [llm]
+# 默认接口与模型
+endpoint = "https://api.openai.com/v1"
+model = "gpt-4o"
 timeout_secs = 120
 max_retries = 3
 base_delay_ms = 500

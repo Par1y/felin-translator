@@ -36,16 +36,26 @@ fn default_template_matches_defaults() {
     // defaults for every *technical* section (only comments are added), so a
     // parsing round-trip yields exactly the default serialization.
     //
-    // `[prompt]` is the one deliberate exception: the template ships the
-    // factory prompt text (its single source of truth, `factory_prompt_config()`)
+    // `[prompt]` is one deliberate exception: the template ships the factory
+    // prompt text (its single source of truth, `factory_prompt_config()`)
     // so a fresh install translates out of the box, while `TechConfig::default()`
     // carries no prompt at all — the runtime is config-driven only and must not
     // bake prompt text into the code. `fresh_startup_felin_toml_is_spec_compliant`
     // separately locks the prompt section's shape.
+    //
+    // `[llm] endpoint`/`model` are the second, for the same reason: the
+    // template ships the factory endpoint/model so a fresh install connects
+    // out of the box, while `LlmDefaults::default()` stays empty — the runtime
+    // must not bake a provider into the code.
     let from_tpl = TechConfig::from_toml_str(&TechConfig::default_template()).unwrap();
     let mut defaults = TechConfig::default();
     defaults.prompt = from_tpl.prompt.clone();
+    defaults.llm.endpoint = from_tpl.llm.endpoint.clone();
+    defaults.llm.model = from_tpl.llm.model.clone();
     assert_eq!(from_tpl.to_toml_string(), defaults.to_toml_string());
+    // The shipped seeds must actually be usable (never an empty template line).
+    assert!(!from_tpl.llm.endpoint.is_empty(), "template must ship an endpoint seed");
+    assert!(!from_tpl.llm.model.is_empty(), "template must ship a model seed");
     // And it documents the user-managed sidecar keys.
     let tpl = TechConfig::default_template();
     assert!(tpl.contains("#   bin    = \"/path/to/ocr-router/bin/ocr-cli\""));
@@ -106,6 +116,21 @@ fn prompt_values_come_from_the_config_file() {
     // Fields omitted from `[prompt]` are empty (not a hidden default).
     assert!(c.prompt.translation_system.is_empty());
     assert!(c.prompt.translation_user.is_empty());
+}
+
+#[test]
+fn llm_endpoint_defaults_are_empty_not_hidden() {
+    // Same config-driven contract as `[prompt]`: no provider is baked into the
+    // runtime — endpoint/model seeds live only in the first-launch felin.toml
+    // template (`default_template_matches_defaults` guards those).
+    let llm = felin_core::config::LlmDefaults::default();
+    assert!(llm.endpoint.is_empty());
+    assert!(llm.model.is_empty());
+    assert!(felin_core::llm::LlmConfig::default().endpoint.is_empty());
+    // A legacy file without these keys parses to empty (never a hidden default).
+    let c = TechConfig::from_toml_str("[llm]\ntimeout_secs = 9\n").unwrap();
+    assert!(c.llm.endpoint.is_empty());
+    assert!(c.llm.model.is_empty());
 }
 
 #[test]
